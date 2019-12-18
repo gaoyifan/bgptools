@@ -3,12 +3,27 @@ use std::fs::File;
 //use std::io::BufWriter;
 use std::io::BufReader;
 
+extern crate structopt;
+use structopt::StructOpt;
+use std::path::PathBuf;
+
+#[derive(StructOpt, Debug)]
+#[structopt(name = "bgpdump")]
+struct Opts {
+    #[structopt(short, long, parse(from_os_str), default_value = "./rib.txt")]
+    bgpdump_result: PathBuf,
+
+    #[structopt(required = true, min_values = 1)]
+    asns: Vec<String>,
+}
+
 fn main() {
-    let asn_list: Vec<i32> = std::env::args()
-        .skip(1)
+    let opts: Opts = Opts::from_args();
+
+    let asn_list: Vec<i32> = opts.asns.into_iter()
         .map(|x| x.parse::<i32>().expect("args(ASN) must be a number!"))
         .collect();
-    let file = File::open("./rib.txt").unwrap();
+    let file = File::open(&opts.bgpdump_result).unwrap();
     let fin = BufReader::new(file);
     let get_cidr = |line_result: Result<String, std::io::Error>| {
         let line = line_result.unwrap();

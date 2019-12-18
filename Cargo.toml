@@ -1,9 +1,10 @@
 [package]
 name = "bgptools"
-version = "0.0.1"
+version = "0.0.2"
 authors = ["Yifan Gao <git@yfgao.com>"]
 description = "BGP rib data analysing"
 repository = "https://github.com/gaoyifan/bgptools"
 license = "MIT"
 
 [dependencies]
+structopt = "0.3"
