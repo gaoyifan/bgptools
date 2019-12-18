@@ -35,10 +35,7 @@ fn main() {
         }
         if asn > 0 && asn_list.iter().find(|&&x| x == asn).is_some() {
             println!("{}",cidr);
-            Some(cidr.to_string())
-        } else {
-            None
         }
     };
-    fin.lines().map(get_cidr).collect::<Vec<_>>();
+    fin.lines().for_each(get_cidr);
 }
