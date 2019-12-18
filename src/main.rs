@@ -8,7 +8,7 @@ use structopt::StructOpt;
 use std::path::PathBuf;
 
 #[derive(StructOpt, Debug)]
-#[structopt(name = "bgpdump")]
+#[structopt(name = "bgptools")]
 struct Opts {
     #[structopt(short, long, parse(from_os_str), default_value = "./rib.txt")]
     bgpdump_result: PathBuf,
