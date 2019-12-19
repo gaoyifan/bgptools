@@ -2,3 +2,7 @@ target
 .idea/
 Cargo.lock
 /china-operator-ip.iml
+rib.bz2
+rib.txt
+rib6.bz2
+rib6.txt
