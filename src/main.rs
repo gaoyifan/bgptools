@@ -1,11 +1,11 @@
 use std::io::prelude::*;
 use std::fs::File;
-//use std::io::BufWriter;
 use std::io::BufReader;
 
 extern crate structopt;
 use structopt::StructOpt;
 use std::path::PathBuf;
+use std::collections::HashSet;
 
 #[derive(StructOpt, Debug)]
 #[structopt(name = "bgptools")]
@@ -20,7 +20,7 @@ struct Opts {
 fn main() {
     let opts: Opts = Opts::from_args();
 
-    let asn_list: Vec<i32> = opts.asns.into_iter()
+    let asn_list: HashSet<i32> = opts.asns.into_iter()
         .map(|x| x.parse::<i32>().expect("args(ASN) must be a number!"))
         .collect();
     let file = File::open(&opts.bgpdump_result).unwrap();
@@ -48,7 +48,7 @@ fn main() {
         if aspath.len() > 0 {
             asn = aspath[aspath.len() - 1];
         }
-        if asn > 0 && asn_list.iter().find(|&&x| x == asn).is_some() {
+        if asn > 0 && asn_list.contains(&asn) {
             println!("{}",cidr);
         }
     };
