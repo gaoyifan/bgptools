@@ -12,7 +12,7 @@ extern crate mrt;
 #[structopt(name = "bgptools")]
 struct Opts {
     #[structopt(short, long, parse(from_os_str), default_value = "./rib")]
-    bgpdump_result: PathBuf,
+    mrt_file: PathBuf,
 
     #[structopt(required = true, min_values = 1)]
     asns: Vec<String>,
@@ -23,7 +23,7 @@ fn main() {
     let asn_list: HashSet<u32> = opts.asns.into_iter()
         .map(|x| x.parse::<u32>().expect("args(ASN) must be a number!"))
         .collect();
-    let file = File::open(&opts.bgpdump_result).unwrap();
+    let file = File::open(&opts.mrt_file).unwrap();
     let entries = mrt::read_file_complete(file).unwrap();
     for entry in &entries {
         if entry.mrt_header.mrt_type != mrt::MrtType::TABLE_DUMP_V2 {
