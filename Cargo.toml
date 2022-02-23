@@ -1,6 +1,6 @@
 [package]
 name = "bgptools"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Yifan Gao <git@yfgao.com>"]
 description = "BGP rib data analysing"
 repository = "https://github.com/gaoyifan/bgptools"
