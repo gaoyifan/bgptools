@@ -8,6 +8,11 @@ use std::collections::HashSet;
 
 extern crate mrt;
 
+extern crate jemallocator;
+
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 #[derive(StructOpt, Debug)]
 #[structopt(name = "bgptools")]
 struct Opts {
@@ -24,7 +29,8 @@ fn main() {
         .map(|x| x.parse::<u32>().expect("args(ASN) must be a number!"))
         .collect();
     let file = File::open(&opts.mrt_file).unwrap();
-    let entries = mrt::read_file_complete(file).unwrap();
+    //let entries = mrt::read_file_complete(file).unwrap();
+    let entries = mrt::mmap_file(file).unwrap();
     for entry in &entries {
         if entry.mrt_header.mrt_type != mrt::MrtType::TABLE_DUMP_V2 {
             continue

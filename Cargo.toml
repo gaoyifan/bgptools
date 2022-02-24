@@ -8,4 +8,5 @@ license = "MIT"
 
 [dependencies]
 structopt = "0.3"
-mrt = "0.2.0"
+mrt = { git = "https://github.com/gaoyifan/mrt.git", rev = "01a8796" }
+jemallocator = "0.3.0"
