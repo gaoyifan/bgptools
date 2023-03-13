@@ -1,10 +1,7 @@
-use std::fs::File;
-
-extern crate structopt;
-
-use structopt::StructOpt;
-use std::path::PathBuf;
 use std::collections::HashSet;
+use std::fs::File;
+use std::path::PathBuf;
+use structopt::StructOpt;
 
 extern crate mrt;
 
@@ -20,17 +17,20 @@ struct Opts {
 
 fn main() {
     let opts: Opts = Opts::from_args();
-    let asn_list: HashSet<u32> = opts.asns.into_iter()
+    let asn_list: HashSet<u32> = opts
+        .asns
+        .into_iter()
         .map(|x| x.parse::<u32>().expect("args(ASN) must be a number!"))
         .collect();
     let file = File::open(&opts.mrt_file).unwrap();
     let entries = mrt::read_file_complete(file).unwrap();
     for entry in &entries {
         if entry.mrt_header.mrt_type != mrt::MrtType::TABLE_DUMP_V2 {
-            continue
+            continue;
         }
         match &entry.message {
-            mrt::MrtMessage::RIB_IPV4_UNICAST { header, entries } | mrt::MrtMessage::RIB_IPV6_UNICAST {header,entries} => {
+            mrt::MrtMessage::RIB_IPV4_UNICAST { header, entries }
+            | mrt::MrtMessage::RIB_IPV6_UNICAST { header, entries } => {
                 let cidr = format!("{}/{}", header.prefix, header.prefix_length);
                 for e in entries {
                     for a in &e.bgp_attributes {
@@ -41,19 +41,18 @@ fn main() {
                                         mrt::SegmentType::AS_SEQUENCE => {
                                             let asn = s.asns.last().unwrap_or(&0);
                                             if *asn > 0 && asn_list.contains(asn) {
-                                                println!("{}",cidr);
+                                                println!("{}", cidr);
                                             }
-                                        },
+                                        }
                                         _ => {}
                                     }
-
                                 }
-                            },
-                            _  => {}
+                            }
+                            _ => {}
                         }
                     }
                 }
-            },
+            }
             _ => {}
         }
     }
