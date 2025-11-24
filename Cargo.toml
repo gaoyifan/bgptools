@@ -10,3 +10,5 @@ license = "MIT"
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 bgpkit-parser = "0.12"
+iprange = "0.6.7"
+ipnet = "2.11.0"
