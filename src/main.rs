@@ -1,25 +1,21 @@
-use bgpkit_parser::{models::ElemType, BgpkitParser};
+use bgpkit_parser::{BgpkitParser, models::ElemType};
+use clap::Parser;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use structopt::StructOpt;
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "bgptools")]
+#[derive(Parser, Debug)]
+#[command(name = "bgptools")]
 struct Opts {
-    #[structopt(short, long, parse(from_os_str), default_value = "./rib")]
+    #[arg(short, long, value_name = "MRT", default_value = "./rib")]
     mrt_file: PathBuf,
 
-    #[structopt(required = true, min_values = 1)]
-    asns: Vec<String>,
+    #[arg(value_name = "ASN", value_parser = clap::value_parser!(u32), num_args = 1..)]
+    asns: Vec<u32>,
 }
 
 fn main() {
-    let opts: Opts = Opts::from_args();
-    let asn_list: HashSet<u32> = opts
-        .asns
-        .into_iter()
-        .map(|x| x.parse::<u32>().expect("args(ASN) must be a number!"))
-        .collect();
+    let opts: Opts = Opts::parse();
+    let asn_list: HashSet<u32> = opts.asns.into_iter().collect();
 
     let rib_path = opts.mrt_file.to_string_lossy().into_owned();
     let parser =
@@ -35,10 +31,7 @@ fn main() {
             None => continue,
         };
 
-        if origins
-            .iter()
-            .any(|asn| asn_list.contains(&asn.to_u32()))
-        {
+        if origins.iter().any(|asn| asn_list.contains(&asn.to_u32())) {
             println!("{}", elem.prefix);
         }
     }

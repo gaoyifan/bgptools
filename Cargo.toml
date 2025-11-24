@@ -1,12 +1,12 @@
 [package]
 name = "bgptools"
 version = "0.1.1"
-edition = "2021"
+edition = "2024"
 authors = ["Yifan Gao <git@yfgao.com>"]
 description = "BGP rib data analysing"
 repository = "https://github.com/gaoyifan/bgptools"
 license = "MIT"
 
 [dependencies]
-structopt = "0.3"
+clap = { version = "4.5", features = ["derive"] }
 bgpkit-parser = "0.12"
