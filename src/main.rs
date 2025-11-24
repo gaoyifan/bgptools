@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "bgptools")]
+#[command(name = "bgptools", version)]
 struct Opts {
     #[arg(short, long, value_name = "MRT", default_value = "./rib")]
     mrt_file: PathBuf,
