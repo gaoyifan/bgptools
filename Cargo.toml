@@ -9,6 +9,4 @@ license = "MIT"
 
 [dependencies]
 structopt = "0.3"
-mrt = "0.2.0"
-what-i-want = "0.1.1"
-try_match = "0.3.0"
+bgpkit-parser = "0.12"
