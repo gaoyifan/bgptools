@@ -38,6 +38,8 @@ impl PrefixBuckets {
         where
             N: IpRangeNet + ToNetwork<N> + Clone + Ord + Eq + std::hash::Hash,
         {
+            let excluded: Vec<_> = excluded.into_iter().collect();
+
             let mut aggregate = IpRange::new();
             for inc in &included {
                 let mut working = IpRange::new();
@@ -96,10 +98,7 @@ fn main() {
             None => continue,
         };
 
-        let net = match elem.prefix.to_string().parse::<IpNet>() {
-            Ok(net) => net,
-            Err(_) => continue,
-        };
+        let net = elem.prefix.prefix;
 
         let has_included_origin = origins.iter().any(|asn| asn_list.contains(&asn.to_u32()));
 
