@@ -2,6 +2,7 @@ use bgpkit_parser::{BgpkitParser, models::ElemType};
 use clap::Parser;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iprange::{IpNet as IpRangeNet, IpRange, ToNetwork};
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -36,27 +37,35 @@ impl PrefixBuckets {
     fn finalize(self) -> (IpRange<Ipv4Net>, IpRange<Ipv6Net>) {
         fn filter_range<N>(included: HashSet<N>, excluded: HashSet<N>) -> IpRange<N>
         where
-            N: IpRangeNet + ToNetwork<N> + Clone + Ord + Eq + std::hash::Hash,
+            N: IpRangeNet + ToNetwork<N> + Clone + Ord + Eq + std::hash::Hash + Send + Sync,
         {
-            let excluded: Vec<_> = excluded.into_iter().collect();
+            let mut excluded: Vec<_> = excluded.into_iter().collect();
+            excluded.sort_unstable_by_key(|net| net.prefix_len());
+
+            let partial_ranges: Vec<IpRange<N>> = included
+                .into_par_iter()
+                .map(|inc| {
+                    let mut working = IpRange::new();
+                    let inc_len = inc.prefix_len();
+                    working.add(inc.clone());
+
+                    for exc in &excluded {
+                        if exc.prefix_len() <= inc_len {
+                            continue;
+                        }
+                        if working.is_empty() {
+                            break;
+                        }
+                        working.remove(exc.clone());
+                    }
+
+                    working
+                })
+                .collect();
 
             let mut aggregate = IpRange::new();
-            for inc in &included {
-                let mut working = IpRange::new();
-                let inc_len = inc.prefix_len();
-                working.add(inc.clone());
-
-                for exc in &excluded {
-                    if exc.prefix_len() <= inc_len {
-                        continue;
-                    }
-                    if working.is_empty() {
-                        break;
-                    }
-                    working.remove(exc.clone());
-                }
-
-                for net in working.iter() {
+            for range in partial_ranges {
+                for net in range.iter() {
                     aggregate.add(net.clone());
                 }
             }
