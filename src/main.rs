@@ -17,43 +17,29 @@ struct Opts {
 
 #[derive(Default)]
 struct PrefixBuckets {
-    included_v4: Vec<Ipv4Net>,
-    included_v6: Vec<Ipv6Net>,
-    excluded_v4: Vec<Ipv4Net>,
-    excluded_v6: Vec<Ipv6Net>,
+    included_v4: HashSet<Ipv4Net>,
+    included_v6: HashSet<Ipv6Net>,
+    excluded_v4: HashSet<Ipv4Net>,
+    excluded_v6: HashSet<Ipv6Net>,
 }
 
 impl PrefixBuckets {
     fn record(&mut self, net: IpNet, has_included_origin: bool) {
         match (net, has_included_origin) {
-            (IpNet::V4(prefix), true) => self.included_v4.push(prefix),
-            (IpNet::V6(prefix), true) => self.included_v6.push(prefix),
-            (IpNet::V4(prefix), false) => self.excluded_v4.push(prefix),
-            (IpNet::V6(prefix), false) => self.excluded_v6.push(prefix),
-        }
+            (IpNet::V4(prefix), true) => self.included_v4.insert(prefix),
+            (IpNet::V6(prefix), true) => self.included_v6.insert(prefix),
+            (IpNet::V4(prefix), false) => self.excluded_v4.insert(prefix),
+            (IpNet::V6(prefix), false) => self.excluded_v6.insert(prefix),
+        };
     }
 
     fn finalize(self) -> (IpRange<Ipv4Net>, IpRange<Ipv6Net>) {
-        fn filter_range<N>(included: Vec<N>, excluded: Vec<N>) -> IpRange<N>
+        fn filter_range<N>(included: HashSet<N>, excluded: HashSet<N>) -> IpRange<N>
         where
             N: IpRangeNet + ToNetwork<N> + Clone + Ord + Eq + std::hash::Hash,
         {
-            fn dedup<N: Eq + std::hash::Hash + Clone>(nets: Vec<N>) -> Vec<N> {
-                let mut seen = HashSet::new();
-                let mut uniq = Vec::new();
-                for net in nets {
-                    if seen.insert(net.clone()) {
-                        uniq.push(net);
-                    }
-                }
-                uniq
-            }
-
-            let included = dedup(included);
-            let excluded = dedup(excluded);
-
             let mut aggregate = IpRange::new();
-            for inc in included {
+            for inc in &included {
                 let mut working = IpRange::new();
                 let inc_len = inc.prefix_len();
                 working.add(inc.clone());
@@ -115,9 +101,7 @@ fn main() {
             Err(_) => continue,
         };
 
-        let has_included_origin = origins
-            .iter()
-            .any(|asn| asn_list.contains(&asn.to_u32()));
+        let has_included_origin = origins.iter().any(|asn| asn_list.contains(&asn.to_u32()));
 
         buckets.record(net, has_included_origin);
     }
@@ -142,16 +126,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn removes_more_specific_from_supernet() {
         use std::str::FromStr;
 
         let buckets = PrefixBuckets {
-            included_v4: vec![Ipv4Net::from_str("10.0.0.0/23").unwrap()],
-            included_v6: Vec::new(),
-            excluded_v4: vec![Ipv4Net::from_str("10.0.0.0/24").unwrap()],
-            excluded_v6: Vec::new(),
+            included_v4: HashSet::from([Ipv4Net::from_str("10.0.0.0/23").unwrap()]),
+            included_v6: HashSet::new(),
+            excluded_v4: HashSet::from([Ipv4Net::from_str("10.0.0.0/24").unwrap()]),
+            excluded_v6: HashSet::new(),
         };
 
         let (filtered_v4, _) = buckets.finalize();
@@ -168,18 +153,16 @@ mod tests {
         let mut buckets = PrefixBuckets::default();
         buckets
             .included_v4
-            .push(Ipv4Net::from_str("223.64.0.0/10").unwrap());
+            .insert(Ipv4Net::from_str("223.64.0.0/10").unwrap());
         buckets
             .excluded_v4
-            .push(Ipv4Net::from_str("223.122.128.0/17").unwrap());
+            .insert(Ipv4Net::from_str("223.122.128.0/17").unwrap());
 
         let (filtered_v4, _) = buckets.finalize();
         let overlap = Ipv4Addr::from_str("223.122.128.1").unwrap();
 
         assert!(
-            filtered_v4
-                .iter()
-                .all(|net| !net.contains(&overlap)),
+            filtered_v4.iter().all(|net| !net.contains(&overlap)),
             "filtered output still covers the excluded address"
         );
     }
@@ -190,10 +173,10 @@ mod tests {
         use std::str::FromStr;
 
         let buckets = PrefixBuckets {
-            included_v4: vec![Ipv4Net::from_str("10.0.0.0/8").unwrap()],
-            included_v6: Vec::new(),
-            excluded_v4: vec![Ipv4Net::from_str("10.0.0.0/24").unwrap()],
-            excluded_v6: Vec::new(),
+            included_v4: HashSet::from([Ipv4Net::from_str("10.0.0.0/8").unwrap()]),
+            included_v6: HashSet::new(),
+            excluded_v4: HashSet::from([Ipv4Net::from_str("10.0.0.0/24").unwrap()]),
+            excluded_v6: HashSet::new(),
         };
 
         let (filtered_v4, _) = buckets.finalize();
@@ -214,16 +197,16 @@ mod tests {
     fn excludes_only_matching_length_in_ipv6() {
         use std::str::FromStr;
 
-        let included = vec![
+        let included = HashSet::from([
             Ipv6Net::from_str("2001:db8::/48").unwrap(),
             Ipv6Net::from_str("2001:db8:1::/48").unwrap(),
-        ];
-        let excluded = vec![Ipv6Net::from_str("2001:db8:1::/64").unwrap()];
+        ]);
+        let excluded = HashSet::from([Ipv6Net::from_str("2001:db8:1::/64").unwrap()]);
 
         let buckets = PrefixBuckets {
-            included_v4: Vec::new(),
+            included_v4: HashSet::new(),
             included_v6: included,
-            excluded_v4: Vec::new(),
+            excluded_v4: HashSet::new(),
             excluded_v6: excluded,
         };
 
@@ -236,7 +219,8 @@ mod tests {
             "first include should stay untouched"
         );
         assert!(
-            nets.iter().all(|net| !net.contains(&std::net::Ipv6Addr::from(0x20010db800010000u128))),
+            nets.iter()
+                .all(|net| !net.contains(&std::net::Ipv6Addr::from(0x20010db800010000u128))),
             "the excluded /64 should be fully stripped"
         );
     }
@@ -246,10 +230,10 @@ mod tests {
         use std::str::FromStr;
 
         let buckets = PrefixBuckets {
-            included_v4: vec![Ipv4Net::from_str("192.0.2.0/24").unwrap()],
-            included_v6: Vec::new(),
-            excluded_v4: vec![Ipv4Net::from_str("192.0.2.0/24").unwrap()],
-            excluded_v6: Vec::new(),
+            included_v4: HashSet::from([Ipv4Net::from_str("192.0.2.0/24").unwrap()]),
+            included_v6: HashSet::new(),
+            excluded_v4: HashSet::from([Ipv4Net::from_str("192.0.2.0/24").unwrap()]),
+            excluded_v6: HashSet::new(),
         };
 
         let (filtered_v4, _) = buckets.finalize();
@@ -261,18 +245,14 @@ mod tests {
     fn duplicated_entries_are_deduplicated() {
         use std::str::FromStr;
 
-        let buckets = PrefixBuckets {
-            included_v4: vec![
-                Ipv4Net::from_str("198.51.100.0/24").unwrap(),
-                Ipv4Net::from_str("198.51.100.0/24").unwrap(),
-            ],
-            included_v6: Vec::new(),
-            excluded_v4: vec![
-                Ipv4Net::from_str("198.51.100.0/25").unwrap(),
-                Ipv4Net::from_str("198.51.100.0/25").unwrap(),
-            ],
-            excluded_v6: Vec::new(),
-        };
+        let include = IpNet::from_str("198.51.100.0/24").unwrap();
+        let exclude = IpNet::from_str("198.51.100.0/25").unwrap();
+
+        let mut buckets = PrefixBuckets::default();
+        buckets.record(include.clone(), true);
+        buckets.record(include, true);
+        buckets.record(exclude.clone(), false);
+        buckets.record(exclude, false);
 
         let (filtered_v4, _) = buckets.finalize();
         let nets: Vec<Ipv4Net> = filtered_v4.iter().collect();
@@ -289,13 +269,13 @@ mod tests {
         use std::str::FromStr;
 
         let buckets = PrefixBuckets {
-            included_v4: vec![Ipv4Net::from_str("100.64.0.0/10").unwrap()],
-            included_v6: Vec::new(),
-            excluded_v4: vec![
+            included_v4: HashSet::from([Ipv4Net::from_str("100.64.0.0/10").unwrap()]),
+            included_v6: HashSet::new(),
+            excluded_v4: HashSet::from([
                 Ipv4Net::from_str("100.64.0.0/11").unwrap(),
                 Ipv4Net::from_str("100.96.0.0/11").unwrap(),
-            ],
-            excluded_v6: Vec::new(),
+            ]),
+            excluded_v6: HashSet::new(),
         };
 
         let (filtered_v4, _) = buckets.finalize();
@@ -307,13 +287,13 @@ mod tests {
         use std::str::FromStr;
 
         let buckets = PrefixBuckets {
-            included_v4: vec![
+            included_v4: HashSet::from([
                 Ipv4Net::from_str("203.0.113.0/25").unwrap(),
                 Ipv4Net::from_str("203.0.113.128/25").unwrap(),
-            ],
-            included_v6: Vec::new(),
-            excluded_v4: vec![Ipv4Net::from_str("203.0.113.0/24").unwrap()],
-            excluded_v6: Vec::new(),
+            ]),
+            included_v6: HashSet::new(),
+            excluded_v4: HashSet::from([Ipv4Net::from_str("203.0.113.0/24").unwrap()]),
+            excluded_v6: HashSet::new(),
         };
 
         let (filtered_v4, _) = buckets.finalize();
