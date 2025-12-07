@@ -6,6 +6,10 @@ use rayon::prelude::*;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+fn is_private_asn(asn: u32) -> bool {
+    (64512..=65534).contains(&asn) || (4_200_000_000..=4_294_967_294).contains(&asn)
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "bgptools", version)]
 struct Opts {
@@ -14,6 +18,9 @@ struct Opts {
 
     #[arg(value_name = "ASN", value_parser = clap::value_parser!(u32), num_args = 1..)]
     asns: Vec<u32>,
+
+    #[arg(long, default_value_t = false)]
+    ignore_private_asn: bool,
 }
 
 #[derive(Default)]
@@ -108,6 +115,10 @@ fn main() {
         };
 
         let net = elem.prefix.prefix;
+
+        if opts.ignore_private_asn && origins.iter().any(|asn| is_private_asn(asn.to_u32())) {
+            continue;
+        }
 
         let has_included_origin = origins.iter().any(|asn| asn_list.contains(&asn.to_u32()));
 
@@ -288,6 +299,16 @@ mod tests {
 
         let (filtered_v4, _) = buckets.finalize();
         assert!(filtered_v4.is_empty());
+    }
+
+    #[test]
+    fn detects_private_asn_ranges() {
+        assert!(is_private_asn(64512));
+        assert!(is_private_asn(65534));
+        assert!(is_private_asn(4_200_000_000));
+        assert!(is_private_asn(4_294_967_294));
+        assert!(!is_private_asn(64511));
+        assert!(!is_private_asn(13335));
     }
 
     #[test]
