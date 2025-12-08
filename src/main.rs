@@ -3,6 +3,7 @@ use clap::{ArgAction, Parser};
 use ipnet::{IpNet, Ipv4Net, Ipv4Subnets, Ipv6Net, Ipv6Subnets};
 use iprange::{IpNet as IpRangeNet, IpRange, ToNetwork};
 use prefix_trie::PrefixMap;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::DefaultHasher};
 use std::fs::File;
@@ -14,6 +15,13 @@ use vec_collections::VecSet;
 
 type AsnRangesV4 = HashMap<u32, IpRange<Ipv4Net>>;
 type AsnRangesV6 = HashMap<u32, IpRange<Ipv6Net>>;
+
+struct ParsedMrtData {
+    prefix_map_v4: PrefixMap<Ipv4Net, VecSet<[u32; 4]>>,
+    prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>>,
+    split_points_v4: BTreeSet<Ipv4Addr>,
+    split_points_v6: BTreeSet<Ipv6Addr>,
+}
 
 fn is_private_asn(asn: u32) -> bool {
     (64512..=65534).contains(&asn) || (4_200_000_000..=4_294_967_294).contains(&asn)
@@ -156,60 +164,27 @@ fn save_cache(path: &Path, cache: CachedRanges) -> CachedRanges {
 }
 
 fn build_asn_ranges(mrt_files: &[PathBuf], ignore_private_asn: bool) -> (AsnRangesV4, AsnRangesV6) {
-    // Step 1: Build PrefixMap<CIDR, VecSet<origin_asn>>
+    // Step 1: parse each MRT file in parallel
+    let parsed: Vec<ParsedMrtData> = mrt_files
+        .par_iter()
+        .map(|mrt_file| process_mrt_file(mrt_file.as_path(), ignore_private_asn))
+        .collect();
+
+    // Step 2: merge prefix maps and split points
     let mut prefix_map_v4: PrefixMap<Ipv4Net, VecSet<[u32; 4]>> = PrefixMap::new();
     let mut prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>> = PrefixMap::new();
-
-    // Step 2: Collect candidate split points
     let mut split_points_v4_set: BTreeSet<Ipv4Addr> = BTreeSet::new();
     let mut split_points_v6_set: BTreeSet<Ipv6Addr> = BTreeSet::new();
 
-    for mrt_file in mrt_files {
-        let rib_path = mrt_file.to_string_lossy().into_owned();
-        let parser = BgpkitParser::new(rib_path.as_str())
-            .unwrap_or_else(|_| panic!("failed to open MRT/RIB file {rib_path} with bgpkit"));
-
-        for elem in parser.into_elem_iter() {
-            if !matches!(elem.elem_type, ElemType::ANNOUNCE) {
-                continue;
-            }
-
-            let origins = match &elem.origin_asns {
-                Some(origins) => origins,
-                None => continue,
-            };
-
-            if ignore_private_asn && origins.iter().any(|asn| is_private_asn(asn.to_u32())) {
-                continue;
-            }
-
-            let origin_asns: HashSet<u32> = origins.iter().map(|asn| asn.to_u32()).collect();
-
-            match elem.prefix.prefix {
-                IpNet::V4(net) => {
-                    // Insert into prefix map
-                    prefix_map_v4.entry(net).or_default().extend(origin_asns);
-
-                    // Collect split points
-                    split_points_v4_set.insert(net.network());
-                    u32::from(net.broadcast())
-                        .checked_add(1)
-                        .map(Ipv4Addr::from)
-                        .map(|e| split_points_v4_set.insert(e));
-                }
-                IpNet::V6(net) => {
-                    // Insert into prefix map
-                    prefix_map_v6.entry(net).or_default().extend(origin_asns);
-
-                    // Collect split points
-                    split_points_v6_set.insert(net.network());
-                    u128::from(net.broadcast())
-                        .checked_add(1)
-                        .map(Ipv6Addr::from)
-                        .map(|e| split_points_v6_set.insert(e));
-                }
-            }
+    for data in parsed {
+        for (net, asns) in data.prefix_map_v4 {
+            prefix_map_v4.entry(net).or_default().extend(asns);
         }
+        for (net, asns) in data.prefix_map_v6 {
+            prefix_map_v6.entry(net).or_default().extend(asns);
+        }
+        split_points_v4_set.extend(data.split_points_v4);
+        split_points_v6_set.extend(data.split_points_v6);
     }
 
     // Step 3: Sort split points (BTreeSet already keeps them sorted)
@@ -261,6 +236,60 @@ fn build_asn_ranges(mrt_files: &[PathBuf], ignore_private_asn: bool) -> (AsnRang
     }
 
     (asn_ranges_v4, asn_ranges_v6)
+}
+
+fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData {
+    let rib_path = mrt_file.to_string_lossy().into_owned();
+    let parser = BgpkitParser::new(rib_path.as_str())
+        .unwrap_or_else(|_| panic!("failed to open MRT/RIB file {rib_path} with bgpkit"));
+
+    let mut prefix_map_v4: PrefixMap<Ipv4Net, VecSet<[u32; 4]>> = PrefixMap::new();
+    let mut prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>> = PrefixMap::new();
+    let mut split_points_v4: BTreeSet<Ipv4Addr> = BTreeSet::new();
+    let mut split_points_v6: BTreeSet<Ipv6Addr> = BTreeSet::new();
+
+    for elem in parser.into_elem_iter() {
+        if !matches!(elem.elem_type, ElemType::ANNOUNCE) {
+            continue;
+        }
+
+        let origins = match &elem.origin_asns {
+            Some(origins) => origins,
+            None => continue,
+        };
+
+        if ignore_private_asn && origins.iter().any(|asn| is_private_asn(asn.to_u32())) {
+            continue;
+        }
+
+        let origin_asns: HashSet<u32> = origins.iter().map(|asn| asn.to_u32()).collect();
+
+        match elem.prefix.prefix {
+            IpNet::V4(net) => {
+                prefix_map_v4.entry(net).or_default().extend(origin_asns);
+                split_points_v4.insert(net.network());
+                u32::from(net.broadcast())
+                    .checked_add(1)
+                    .map(Ipv4Addr::from)
+                    .map(|e| split_points_v4.insert(e));
+            }
+            IpNet::V6(net) => {
+                prefix_map_v6.entry(net).or_default().extend(origin_asns);
+                split_points_v6.insert(net.network());
+                u128::from(net.broadcast())
+                    .checked_add(1)
+                    .map(Ipv6Addr::from)
+                    .map(|e| split_points_v6.insert(e));
+            }
+        }
+    }
+
+    ParsedMrtData {
+        prefix_map_v4,
+        prefix_map_v6,
+        split_points_v4,
+        split_points_v6,
+    }
 }
 
 #[cfg(test)]

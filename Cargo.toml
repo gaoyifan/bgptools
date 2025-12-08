@@ -16,3 +16,4 @@ prefix-trie = { version = "0.8", features = ["ipnet"] }
 vec-collections = "0.4.3"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
+rayon = "1.10"
