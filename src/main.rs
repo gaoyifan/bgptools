@@ -1,11 +1,12 @@
 use bgpkit_parser::{BgpkitParser, models::ElemType};
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use ipnet::{IpNet, Ipv4Net, Ipv4Subnets, Ipv6Net, Ipv6Subnets};
 use iprange::{IpNet as IpRangeNet, IpRange, ToNetwork};
 use prefix_trie::PrefixMap;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, hash_map::DefaultHasher};
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
@@ -21,8 +22,8 @@ fn is_private_asn(asn: u32) -> bool {
 #[derive(Parser, Debug)]
 #[command(name = "bgptools", version)]
 struct Opts {
-    #[arg(short, long, value_name = "MRT", default_value = "./rib")]
-    mrt_file: PathBuf,
+    #[arg(short, long = "mrt-file", value_name = "MRT", action = ArgAction::Append)]
+    mrt_files: Vec<PathBuf>,
 
     #[arg(value_name = "ASN", value_parser = clap::value_parser!(u32), num_args = 1..)]
     asns: Vec<u32>,
@@ -30,36 +31,34 @@ struct Opts {
     #[arg(long, default_value_t = false)]
     ignore_private_asn: bool,
 
-    #[arg(long, value_name = "CACHE")]
-    cache: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    cache: bool,
 }
 
 fn main() {
     let Opts {
-        mrt_file,
+        mrt_files,
         asns,
         ignore_private_asn,
         cache,
     } = Opts::parse();
     let asn_list: HashSet<u32> = asns.into_iter().collect();
 
-    let (asn_ranges_v4, asn_ranges_v6) = cache
-        .as_deref()
-        .and_then(|path| load_cache(path, ignore_private_asn))
-        .unwrap_or_else(|| {
-            let (v4, v6) = build_asn_ranges(&mrt_file, ignore_private_asn);
-            if let Some(path) = cache.as_deref() {
-                let cached = CachedRanges {
-                    ignore_private_asn,
-                    v4,
-                    v6,
-                };
-                let CachedRanges { v4, v6, .. } = save_cache(path, cached);
-                (v4, v6)
-            } else {
-                (v4, v6)
-            }
-        });
+    let (asn_ranges_v4, asn_ranges_v6) = if cache {
+        let cache_path = cache_path(&mrt_files, ignore_private_asn);
+        load_cache(&cache_path, ignore_private_asn).unwrap_or_else(|| {
+            let (v4, v6) = build_asn_ranges(&mrt_files, ignore_private_asn);
+            let cached = CachedRanges {
+                ignore_private_asn,
+                v4,
+                v6,
+            };
+            let CachedRanges { v4, v6, .. } = save_cache(&cache_path, cached);
+            (v4, v6)
+        })
+    } else {
+        build_asn_ranges(&mrt_files, ignore_private_asn)
+    };
 
     let mut result_v4: IpRange<Ipv4Net> = IpRange::new();
     let mut result_v6: IpRange<Ipv6Net> = IpRange::new();
@@ -123,6 +122,20 @@ struct CachedRanges {
     v6: AsnRangesV6,
 }
 
+fn cache_path(mrt_files: &[PathBuf], ignore_private_asn: bool) -> PathBuf {
+    let mut sources: Vec<String> = mrt_files
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    sources.sort();
+
+    let mut hasher = DefaultHasher::new();
+    ignore_private_asn.hash(&mut hasher);
+    sources.hash(&mut hasher);
+    let hash = hasher.finish();
+    PathBuf::from(format!("cache-{hash:016x}.bin"))
+}
+
 fn load_cache(path: &Path, ignore_private_asn: bool) -> Option<(AsnRangesV4, AsnRangesV6)> {
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
@@ -142,11 +155,7 @@ fn save_cache(path: &Path, cache: CachedRanges) -> CachedRanges {
     cache
 }
 
-fn build_asn_ranges(mrt_file: &Path, ignore_private_asn: bool) -> (AsnRangesV4, AsnRangesV6) {
-    let rib_path = mrt_file.to_string_lossy().into_owned();
-    let parser =
-        BgpkitParser::new(rib_path.as_str()).expect("failed to open MRT/RIB file with bgpkit");
-
+fn build_asn_ranges(mrt_files: &[PathBuf], ignore_private_asn: bool) -> (AsnRangesV4, AsnRangesV6) {
     // Step 1: Build PrefixMap<CIDR, VecSet<origin_asn>>
     let mut prefix_map_v4: PrefixMap<Ipv4Net, VecSet<[u32; 4]>> = PrefixMap::new();
     let mut prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>> = PrefixMap::new();
@@ -155,44 +164,50 @@ fn build_asn_ranges(mrt_file: &Path, ignore_private_asn: bool) -> (AsnRangesV4, 
     let mut split_points_v4_set: BTreeSet<Ipv4Addr> = BTreeSet::new();
     let mut split_points_v6_set: BTreeSet<Ipv6Addr> = BTreeSet::new();
 
-    for elem in parser.into_elem_iter() {
-        if !matches!(elem.elem_type, ElemType::ANNOUNCE) {
-            continue;
-        }
+    for mrt_file in mrt_files {
+        let rib_path = mrt_file.to_string_lossy().into_owned();
+        let parser = BgpkitParser::new(rib_path.as_str())
+            .unwrap_or_else(|_| panic!("failed to open MRT/RIB file {rib_path} with bgpkit"));
 
-        let origins = match &elem.origin_asns {
-            Some(origins) => origins,
-            None => continue,
-        };
-
-        if ignore_private_asn && origins.iter().any(|asn| is_private_asn(asn.to_u32())) {
-            continue;
-        }
-
-        let origin_asns: HashSet<u32> = origins.iter().map(|asn| asn.to_u32()).collect();
-
-        match elem.prefix.prefix {
-            IpNet::V4(net) => {
-                // Insert into prefix map
-                prefix_map_v4.entry(net).or_default().extend(origin_asns);
-
-                // Collect split points
-                split_points_v4_set.insert(net.network());
-                u32::from(net.broadcast())
-                    .checked_add(1)
-                    .map(Ipv4Addr::from)
-                    .map(|e| split_points_v4_set.insert(e));
+        for elem in parser.into_elem_iter() {
+            if !matches!(elem.elem_type, ElemType::ANNOUNCE) {
+                continue;
             }
-            IpNet::V6(net) => {
-                // Insert into prefix map
-                prefix_map_v6.entry(net).or_default().extend(origin_asns);
 
-                // Collect split points
-                split_points_v6_set.insert(net.network());
-                u128::from(net.broadcast())
-                    .checked_add(1)
-                    .map(Ipv6Addr::from)
-                    .map(|e| split_points_v6_set.insert(e));
+            let origins = match &elem.origin_asns {
+                Some(origins) => origins,
+                None => continue,
+            };
+
+            if ignore_private_asn && origins.iter().any(|asn| is_private_asn(asn.to_u32())) {
+                continue;
+            }
+
+            let origin_asns: HashSet<u32> = origins.iter().map(|asn| asn.to_u32()).collect();
+
+            match elem.prefix.prefix {
+                IpNet::V4(net) => {
+                    // Insert into prefix map
+                    prefix_map_v4.entry(net).or_default().extend(origin_asns);
+
+                    // Collect split points
+                    split_points_v4_set.insert(net.network());
+                    u32::from(net.broadcast())
+                        .checked_add(1)
+                        .map(Ipv4Addr::from)
+                        .map(|e| split_points_v4_set.insert(e));
+                }
+                IpNet::V6(net) => {
+                    // Insert into prefix map
+                    prefix_map_v6.entry(net).or_default().extend(origin_asns);
+
+                    // Collect split points
+                    split_points_v6_set.insert(net.network());
+                    u128::from(net.broadcast())
+                        .checked_add(1)
+                        .map(Ipv6Addr::from)
+                        .map(|e| split_points_v6_set.insert(e));
+                }
             }
         }
     }
