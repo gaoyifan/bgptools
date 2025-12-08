@@ -1,10 +1,12 @@
-use bgpkit_parser::{BgpkitParser, models::ElemType};
+use bgpkit_parser::{models::ElemType, BgpkitParser};
 use clap::Parser;
-use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use ipnet::{IpNet, Ipv4Net, Ipv4Subnets, Ipv6Net, Ipv6Subnets};
 use iprange::{IpNet as IpRangeNet, IpRange, ToNetwork};
-use rayon::prelude::*;
-use std::collections::HashSet;
+use prefix_trie::PrefixMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
+use vec_collections::VecSet;
 
 fn is_private_asn(asn: u32) -> bool {
     (64512..=65534).contains(&asn) || (4_200_000_000..=4_294_967_294).contains(&asn)
@@ -23,77 +25,6 @@ struct Opts {
     ignore_private_asn: bool,
 }
 
-#[derive(Default)]
-struct PrefixBuckets {
-    included_v4: HashSet<Ipv4Net>,
-    included_v6: HashSet<Ipv6Net>,
-    excluded_v4: HashSet<Ipv4Net>,
-    excluded_v6: HashSet<Ipv6Net>,
-}
-
-impl PrefixBuckets {
-    fn record(&mut self, net: IpNet, has_included_origin: bool) {
-        match (net, has_included_origin) {
-            (IpNet::V4(prefix), true) => self.included_v4.insert(prefix),
-            (IpNet::V6(prefix), true) => self.included_v6.insert(prefix),
-            (IpNet::V4(prefix), false) => self.excluded_v4.insert(prefix),
-            (IpNet::V6(prefix), false) => self.excluded_v6.insert(prefix),
-        };
-    }
-
-    fn finalize(self) -> (IpRange<Ipv4Net>, IpRange<Ipv6Net>) {
-        fn filter_range<N>(included: HashSet<N>, excluded: HashSet<N>) -> IpRange<N>
-        where
-            N: IpRangeNet + ToNetwork<N> + Clone + Ord + Eq + std::hash::Hash + Send + Sync,
-        {
-            let mut excluded: Vec<_> = excluded.into_iter().collect();
-            excluded.sort_unstable_by_key(|net| net.prefix_len());
-
-            let partial_ranges: Vec<IpRange<N>> = included
-                .into_par_iter()
-                .map(|inc| {
-                    let mut working = IpRange::new();
-                    let inc_len = inc.prefix_len();
-                    working.add(inc.clone());
-
-                    for exc in &excluded {
-                        if exc.prefix_len() <= inc_len {
-                            continue;
-                        }
-                        if working.is_empty() {
-                            break;
-                        }
-                        working.remove(exc.clone());
-                    }
-
-                    working
-                })
-                .collect();
-
-            let mut aggregate = IpRange::new();
-            for range in partial_ranges {
-                for net in range.iter() {
-                    aggregate.add(net.clone());
-                }
-            }
-
-            aggregate.simplify();
-            aggregate
-        }
-
-        let PrefixBuckets {
-            included_v4,
-            included_v6,
-            excluded_v4,
-            excluded_v6,
-        } = self;
-
-        let filtered_v4 = filter_range(included_v4, excluded_v4);
-        let filtered_v6 = filter_range(included_v6, excluded_v6);
-        (filtered_v4, filtered_v6)
-    }
-}
-
 fn main() {
     let opts: Opts = Opts::parse();
     let asn_list: HashSet<u32> = opts.asns.into_iter().collect();
@@ -102,7 +33,13 @@ fn main() {
     let parser =
         BgpkitParser::new(rib_path.as_str()).expect("failed to open MRT/RIB file with bgpkit");
 
-    let mut buckets = PrefixBuckets::default();
+    // Step 1: Build PrefixMap<CIDR, VecSet<origin_asn>>
+    let mut prefix_map_v4: PrefixMap<Ipv4Net, VecSet<[u32; 4]>> = PrefixMap::new();
+    let mut prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>> = PrefixMap::new();
+
+    // Step 2: Collect candidate split points
+    let mut split_points_v4_set: BTreeSet<Ipv4Addr> = BTreeSet::new();
+    let mut split_points_v6_set: BTreeSet<Ipv6Addr> = BTreeSet::new();
 
     for elem in parser.into_elem_iter() {
         if !matches!(elem.elem_type, ElemType::ANNOUNCE) {
@@ -114,21 +51,135 @@ fn main() {
             None => continue,
         };
 
-        let net = elem.prefix.prefix;
-
         if opts.ignore_private_asn && origins.iter().any(|asn| is_private_asn(asn.to_u32())) {
             continue;
         }
 
-        let has_included_origin = origins.iter().any(|asn| asn_list.contains(&asn.to_u32()));
+        let origin_asns: HashSet<u32> = origins.iter().map(|asn| asn.to_u32()).collect();
 
-        buckets.record(net, has_included_origin);
+        match elem.prefix.prefix {
+            IpNet::V4(net) => {
+                // Insert into prefix map
+                prefix_map_v4
+                    .entry(net)
+                    .or_default()
+                    .extend(origin_asns);
+
+                // Collect split points
+                split_points_v4_set.insert(net.network());
+                u32::from(net.broadcast())
+                    .checked_add(1)
+                    .map(Ipv4Addr::from)
+                    .map(|e| split_points_v4_set.insert(e));
+            }
+            IpNet::V6(net) => {
+                // Insert into prefix map
+                prefix_map_v6
+                    .entry(net)
+                    .or_default()
+                    .extend(origin_asns);
+
+                // Collect split points
+                split_points_v6_set.insert(net.network());
+                u128::from(net.broadcast())
+                    .checked_add(1)
+                    .map(Ipv6Addr::from)
+                    .map(|e| split_points_v6_set.insert(e));
+            }
+        }
     }
 
-    let (filtered_v4, filtered_v6) = buckets.finalize();
+    // Step 3: Sort split points (BTreeSet already keeps them sorted)
+    let split_points_v4: Vec<Ipv4Addr> = split_points_v4_set.into_iter().collect();
+    let split_points_v6: Vec<Ipv6Addr> = split_points_v6_set.into_iter().collect();
 
-    emit_sorted(&filtered_v4);
-    emit_sorted(&filtered_v6);
+    // Step 4: Build origin-AS to IP range mapping
+    let mut asn_ranges_v4: HashMap<u32, IpRange<Ipv4Net>> = HashMap::new();
+    let mut asn_ranges_v6: HashMap<u32, IpRange<Ipv6Net>> = HashMap::new();
+
+    // Process IPv4 split points
+    for i in 0..split_points_v4.len().saturating_sub(1) {
+        let start = split_points_v4[i];
+        let end = split_points_v4[i + 1];
+
+        // Look up origin ASNs at this exact address using longest prefix match
+        let lookup_prefix = Ipv4Net::new(start, 32).unwrap();
+        if let Some((_, asns)) = prefix_map_v4.get_lpm(&lookup_prefix) {
+            // For each origin ASN, add this interval
+            for &asn in asns {
+                // Convert interval [start, end) to CIDR ranges
+                let nets = interval_to_cidrs_v4(start, end);
+                let range = asn_ranges_v4.entry(asn).or_insert_with(IpRange::new);
+                for net in nets {
+                    range.add(net);
+                }
+            }
+        }
+    }
+
+    // Process IPv6 split points
+    for i in 0..split_points_v6.len().saturating_sub(1) {
+        let start = split_points_v6[i];
+        let end = split_points_v6[i + 1];
+
+        // Look up origin ASNs at this exact address using longest prefix match
+        let lookup_prefix = Ipv6Net::new(start, 128).unwrap();
+        if let Some((_, asns)) = prefix_map_v6.get_lpm(&lookup_prefix) {
+            // For each origin ASN, add this interval
+            for &asn in asns {
+                // Convert interval [start, end) to CIDR ranges
+                let nets = interval_to_cidrs_v6(start, end);
+                let range = asn_ranges_v6.entry(asn).or_insert_with(IpRange::new);
+                for net in nets {
+                    range.add(net);
+                }
+            }
+        }
+    }
+
+    // Step 5: Filter and merge IP ranges for target ASNs
+    let mut result_v4: IpRange<Ipv4Net> = IpRange::new();
+    let mut result_v6: IpRange<Ipv6Net> = IpRange::new();
+
+    for asn in &asn_list {
+        if let Some(range) = asn_ranges_v4.get(asn) {
+            for net in range.iter() {
+                result_v4.add(net);
+            }
+        }
+        if let Some(range) = asn_ranges_v6.get(asn) {
+            for net in range.iter() {
+                result_v6.add(net);
+            }
+        }
+    }
+
+    result_v4.simplify();
+    result_v6.simplify();
+
+    // Output
+    emit_sorted(&result_v4);
+    emit_sorted(&result_v6);
+}
+
+/// Convert an IP interval [start, end) to a list of CIDR prefixes.
+fn interval_to_cidrs_v4(start: Ipv4Addr, end: Ipv4Addr) -> Vec<Ipv4Net> {
+    if start >= end {
+        return Vec::new();
+    }
+
+    let end_inclusive = u32::from(end).saturating_sub(1);
+    Ipv4Subnets::new(start, Ipv4Addr::from(end_inclusive), 0).collect()
+}
+
+/// Convert an IP interval [start, end) to a list of CIDR prefixes.
+fn interval_to_cidrs_v6(start: Ipv6Addr, end: Ipv6Addr) -> Vec<Ipv6Net> {
+    if start >= end {
+        return Vec::new();
+    }
+
+    let end_inclusive = u128::from(end).saturating_sub(1);
+    Ipv6Subnets::new(start, Ipv6Addr::from(end_inclusive), 0).collect()
 }
 
 fn emit_sorted<N>(range: &IpRange<N>)
@@ -145,160 +196,46 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::str::FromStr;
 
     #[test]
-    fn removes_more_specific_from_supernet() {
-        use std::str::FromStr;
-
-        let buckets = PrefixBuckets {
-            included_v4: HashSet::from([Ipv4Net::from_str("10.0.0.0/23").unwrap()]),
-            included_v6: HashSet::new(),
-            excluded_v4: HashSet::from([Ipv4Net::from_str("10.0.0.0/24").unwrap()]),
-            excluded_v6: HashSet::new(),
-        };
-
-        let (filtered_v4, _) = buckets.finalize();
-        let nets: Vec<Ipv4Net> = filtered_v4.iter().collect();
-
-        assert_eq!(nets, vec![Ipv4Net::from_str("10.0.1.0/24").unwrap()]);
+    fn test_interval_to_cidrs_v4_simple() {
+        let start = Ipv4Addr::from_str("192.168.0.0").unwrap();
+        let end = Ipv4Addr::from_str("192.168.1.0").unwrap();
+        let cidrs = interval_to_cidrs_v4(start, end);
+        assert_eq!(cidrs.len(), 1);
+        assert_eq!(cidrs[0], Ipv4Net::from_str("192.168.0.0/24").unwrap());
     }
 
     #[test]
-    fn excludes_more_specific_overlap() {
-        use std::net::Ipv4Addr;
-        use std::str::FromStr;
-
-        let mut buckets = PrefixBuckets::default();
-        buckets
-            .included_v4
-            .insert(Ipv4Net::from_str("223.64.0.0/10").unwrap());
-        buckets
-            .excluded_v4
-            .insert(Ipv4Net::from_str("223.122.128.0/17").unwrap());
-
-        let (filtered_v4, _) = buckets.finalize();
-        let overlap = Ipv4Addr::from_str("223.122.128.1").unwrap();
-
-        assert!(
-            filtered_v4.iter().all(|net| !net.contains(&overlap)),
-            "filtered output still covers the excluded address"
-        );
+    fn test_interval_to_cidrs_v4_complex() {
+        // [10.0.0.0, 10.0.2.0) should produce 10.0.0.0/23
+        let start = Ipv4Addr::from_str("10.0.0.0").unwrap();
+        let end = Ipv4Addr::from_str("10.0.2.0").unwrap();
+        let cidrs = interval_to_cidrs_v4(start, end);
+        assert_eq!(cidrs.len(), 1);
+        assert_eq!(cidrs[0], Ipv4Net::from_str("10.0.0.0/23").unwrap());
     }
 
     #[test]
-    fn per_include_removal_leaves_gap() {
-        use std::net::Ipv4Addr;
-        use std::str::FromStr;
-
-        let buckets = PrefixBuckets {
-            included_v4: HashSet::from([Ipv4Net::from_str("10.0.0.0/8").unwrap()]),
-            included_v6: HashSet::new(),
-            excluded_v4: HashSet::from([Ipv4Net::from_str("10.0.0.0/24").unwrap()]),
-            excluded_v6: HashSet::new(),
-        };
-
-        let (filtered_v4, _) = buckets.finalize();
-        let missing = Ipv4Addr::new(10, 0, 0, 1);
-        let present = Ipv4Addr::new(10, 0, 2, 1);
-
-        assert!(
-            !filtered_v4.iter().any(|net| net.contains(&missing)),
-            "gap address should be removed"
-        );
-        assert!(
-            filtered_v4.iter().any(|net| net.contains(&present)),
-            "non-overlapping address should remain"
-        );
+    fn test_interval_to_cidrs_v4_unaligned() {
+        // [10.0.1.0, 10.0.2.0) should produce 10.0.1.0/24
+        let start = Ipv4Addr::from_str("10.0.1.0").unwrap();
+        let end = Ipv4Addr::from_str("10.0.2.0").unwrap();
+        let cidrs = interval_to_cidrs_v4(start, end);
+        assert_eq!(cidrs.len(), 1);
+        assert_eq!(cidrs[0], Ipv4Net::from_str("10.0.1.0/24").unwrap());
     }
 
     #[test]
-    fn excludes_only_matching_length_in_ipv6() {
-        use std::str::FromStr;
-
-        let included = HashSet::from([
-            Ipv6Net::from_str("2001:db8::/48").unwrap(),
-            Ipv6Net::from_str("2001:db8:1::/48").unwrap(),
-        ]);
-        let excluded = HashSet::from([Ipv6Net::from_str("2001:db8:1::/64").unwrap()]);
-
-        let buckets = PrefixBuckets {
-            included_v4: HashSet::new(),
-            included_v6: included,
-            excluded_v4: HashSet::new(),
-            excluded_v6: excluded,
-        };
-
-        let (_, filtered_v6) = buckets.finalize();
-        let nets: Vec<Ipv6Net> = filtered_v6.iter().collect();
-
-        assert!(
-            nets.iter()
-                .any(|net| net == &Ipv6Net::from_str("2001:db8::/48").unwrap()),
-            "first include should stay untouched"
-        );
-        assert!(
-            nets.iter()
-                .all(|net| !net.contains(&std::net::Ipv6Addr::from(0x20010db800010000u128))),
-            "the excluded /64 should be fully stripped"
-        );
-    }
-
-    #[test]
-    fn exclude_same_as_include_is_ignored() {
-        use std::str::FromStr;
-
-        let buckets = PrefixBuckets {
-            included_v4: HashSet::from([Ipv4Net::from_str("192.0.2.0/24").unwrap()]),
-            included_v6: HashSet::new(),
-            excluded_v4: HashSet::from([Ipv4Net::from_str("192.0.2.0/24").unwrap()]),
-            excluded_v6: HashSet::new(),
-        };
-
-        let (filtered_v4, _) = buckets.finalize();
-        let nets: Vec<Ipv4Net> = filtered_v4.iter().collect();
-        assert_eq!(nets, vec![Ipv4Net::from_str("192.0.2.0/24").unwrap()]);
-    }
-
-    #[test]
-    fn duplicated_entries_are_deduplicated() {
-        use std::str::FromStr;
-
-        let include = IpNet::from_str("198.51.100.0/24").unwrap();
-        let exclude = IpNet::from_str("198.51.100.0/25").unwrap();
-
-        let mut buckets = PrefixBuckets::default();
-        buckets.record(include.clone(), true);
-        buckets.record(include, true);
-        buckets.record(exclude.clone(), false);
-        buckets.record(exclude, false);
-
-        let (filtered_v4, _) = buckets.finalize();
-        let nets: Vec<Ipv4Net> = filtered_v4.iter().collect();
-
-        assert_eq!(nets.len(), 1);
-        assert!(
-            nets.contains(&Ipv4Net::from_str("198.51.100.128/25").unwrap()),
-            "only upper half should remain"
-        );
-    }
-
-    #[test]
-    fn overlapping_excludes_are_applied_sequentially() {
-        use std::str::FromStr;
-
-        let buckets = PrefixBuckets {
-            included_v4: HashSet::from([Ipv4Net::from_str("100.64.0.0/10").unwrap()]),
-            included_v6: HashSet::new(),
-            excluded_v4: HashSet::from([
-                Ipv4Net::from_str("100.64.0.0/11").unwrap(),
-                Ipv4Net::from_str("100.96.0.0/11").unwrap(),
-            ]),
-            excluded_v6: HashSet::new(),
-        };
-
-        let (filtered_v4, _) = buckets.finalize();
-        assert!(filtered_v4.is_empty());
+    fn test_interval_to_cidrs_v4_multiple() {
+        // [10.0.1.0, 10.0.3.0) should produce 10.0.1.0/24, 10.0.2.0/24
+        let start = Ipv4Addr::from_str("10.0.1.0").unwrap();
+        let end = Ipv4Addr::from_str("10.0.3.0").unwrap();
+        let cidrs = interval_to_cidrs_v4(start, end);
+        assert_eq!(cidrs.len(), 2);
+        assert!(cidrs.contains(&Ipv4Net::from_str("10.0.1.0/24").unwrap()));
+        assert!(cidrs.contains(&Ipv4Net::from_str("10.0.2.0/24").unwrap()));
     }
 
     #[test]
@@ -309,24 +246,5 @@ mod tests {
         assert!(is_private_asn(4_294_967_294));
         assert!(!is_private_asn(64511));
         assert!(!is_private_asn(13335));
-    }
-
-    #[test]
-    fn exclude_supernet_removes_multiple_includes() {
-        use std::str::FromStr;
-
-        let buckets = PrefixBuckets {
-            included_v4: HashSet::from([
-                Ipv4Net::from_str("203.0.113.0/25").unwrap(),
-                Ipv4Net::from_str("203.0.113.128/25").unwrap(),
-            ]),
-            included_v6: HashSet::new(),
-            excluded_v4: HashSet::from([Ipv4Net::from_str("203.0.113.0/24").unwrap()]),
-            excluded_v6: HashSet::new(),
-        };
-
-        let (filtered_v4, _) = buckets.finalize();
-        let nets: Vec<Ipv4Net> = filtered_v4.iter().collect();
-        assert_eq!(nets, vec![Ipv4Net::from_str("203.0.113.0/24").unwrap()]);
     }
 }
