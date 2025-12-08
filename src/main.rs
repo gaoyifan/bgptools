@@ -11,6 +11,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
+use smallvec::SmallVec;
 use vec_collections::VecSet;
 
 type AsnRangesV4 = HashMap<u32, IpRange<Ipv4Net>>;
@@ -19,6 +20,8 @@ type AsnRangesV6 = HashMap<u32, IpRange<Ipv6Net>>;
 struct ParsedMrtData {
     prefix_map_v4: PrefixMap<Ipv4Net, VecSet<[u32; 4]>>,
     prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>>,
+    as_paths_v4: HashMap<Ipv4Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>>,
+    as_paths_v6: HashMap<Ipv6Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>>,
     split_points_v4: BTreeSet<Ipv4Addr>,
     split_points_v6: BTreeSet<Ipv6Addr>,
 }
@@ -112,6 +115,32 @@ fn interval_to_cidrs_v6(start: Ipv6Addr, end: Ipv6Addr) -> Vec<Ipv6Net> {
     Ipv6Subnets::new(start, Ipv6Addr::from(end_inclusive), 0).collect()
 }
 
+/// Compute the longest common suffix of a collection of AS paths, capped to the last 4 elements.
+fn longest_common_suffix(paths: &[SmallVec<[u32; 4]>]) -> SmallVec<[u32; 4]> {
+    if paths.is_empty() {
+        return SmallVec::new();
+    }
+
+    let min_len = paths.iter().map(|p| p.len()).min().unwrap_or(0).min(4);
+    let mut suffix: SmallVec<[u32; 4]> = SmallVec::new();
+
+    for i in 0..min_len {
+        let idx = paths[0].len().saturating_sub(1 + i);
+        let candidate = paths[0][idx];
+        if paths
+            .iter()
+            .all(|path| path[path.len().saturating_sub(1 + i)] == candidate)
+        {
+            suffix.push(candidate);
+        } else {
+            break;
+        }
+    }
+
+    suffix.reverse();
+    suffix
+}
+
 fn emit_sorted<N>(range: &IpRange<N>)
 where
     N: IpRangeNet + ToNetwork<N> + Clone + Ord + std::fmt::Display,
@@ -173,6 +202,8 @@ fn build_asn_ranges(mrt_files: &[PathBuf], ignore_private_asn: bool) -> (AsnRang
     // Step 2: merge prefix maps and split points
     let mut prefix_map_v4: PrefixMap<Ipv4Net, VecSet<[u32; 4]>> = PrefixMap::new();
     let mut prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>> = PrefixMap::new();
+    let mut as_paths_v4: HashMap<Ipv4Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
+    let mut as_paths_v6: HashMap<Ipv6Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
     let mut split_points_v4_set: BTreeSet<Ipv4Addr> = BTreeSet::new();
     let mut split_points_v6_set: BTreeSet<Ipv6Addr> = BTreeSet::new();
 
@@ -183,6 +214,18 @@ fn build_asn_ranges(mrt_files: &[PathBuf], ignore_private_asn: bool) -> (AsnRang
         for (net, asns) in data.prefix_map_v6 {
             prefix_map_v6.entry(net).or_default().extend(asns);
         }
+        for (net, origins) in data.as_paths_v4 {
+            let entry = as_paths_v4.entry(net).or_default();
+            for (origin, paths) in origins {
+                entry.entry(origin).or_default().extend(paths);
+            }
+        }
+        for (net, origins) in data.as_paths_v6 {
+            let entry = as_paths_v6.entry(net).or_default();
+            for (origin, paths) in origins {
+                entry.entry(origin).or_default().extend(paths);
+            }
+        }
         split_points_v4_set.extend(data.split_points_v4);
         split_points_v6_set.extend(data.split_points_v6);
     }
@@ -190,6 +233,23 @@ fn build_asn_ranges(mrt_files: &[PathBuf], ignore_private_asn: bool) -> (AsnRang
     // Step 3: Sort split points (BTreeSet already keeps them sorted)
     let split_points_v4: Vec<Ipv4Addr> = split_points_v4_set.into_iter().collect();
     let split_points_v6: Vec<Ipv6Addr> = split_points_v6_set.into_iter().collect();
+
+    // Incorporate shared upstream ASNs (longest common suffix) across all MRT files
+    for (net, origins) in as_paths_v4 {
+        let entry = prefix_map_v4.entry(net).or_default();
+        for (_origin, paths) in origins {
+            let shared_upstreams = longest_common_suffix(&paths);
+            entry.extend(shared_upstreams);
+        }
+    }
+
+    for (net, origins) in as_paths_v6 {
+        let entry = prefix_map_v6.entry(net).or_default();
+        for (_origin, paths) in origins {
+            let shared_upstreams = longest_common_suffix(&paths);
+            entry.extend(shared_upstreams);
+        }
+    }
 
     // Step 4: Build origin-AS to IP range mapping
     let mut asn_ranges_v4: AsnRangesV4 = HashMap::new();
@@ -245,6 +305,8 @@ fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData 
 
     let mut prefix_map_v4: PrefixMap<Ipv4Net, VecSet<[u32; 4]>> = PrefixMap::new();
     let mut prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>> = PrefixMap::new();
+    let mut as_paths_v4: HashMap<Ipv4Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
+    let mut as_paths_v6: HashMap<Ipv6Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
     let mut split_points_v4: BTreeSet<Ipv4Addr> = BTreeSet::new();
     let mut split_points_v6: BTreeSet<Ipv6Addr> = BTreeSet::new();
 
@@ -263,23 +325,48 @@ fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData 
         }
 
         let origin_asns: HashSet<u32> = origins.iter().map(|asn| asn.to_u32()).collect();
+        let as_path: Option<SmallVec<[u32; 4]>> = elem
+            .as_path
+            .as_ref()
+            .and_then(|path| path.to_u32_vec_opt(false))
+            .map(|mut path| {
+                if path.len() > 4 {
+                    let len = path.len();
+                    path = path[len.saturating_sub(4)..].to_vec();
+                }
+                SmallVec::from_vec(path)
+            });
 
         match elem.prefix.prefix {
             IpNet::V4(net) => {
-                prefix_map_v4.entry(net).or_default().extend(origin_asns);
+                prefix_map_v4.entry(net).or_default().extend(origin_asns.iter().copied());
                 split_points_v4.insert(net.network());
                 u32::from(net.broadcast())
                     .checked_add(1)
                     .map(Ipv4Addr::from)
                     .map(|e| split_points_v4.insert(e));
+
+                if let Some(path) = &as_path {
+                    let entry = as_paths_v4.entry(net).or_default();
+                    for &origin in &origin_asns {
+                        entry.entry(origin).or_default().push(path.clone());
+                    }
+                }
             }
             IpNet::V6(net) => {
-                prefix_map_v6.entry(net).or_default().extend(origin_asns);
+                prefix_map_v6.entry(net).or_default().extend(origin_asns.iter().copied());
                 split_points_v6.insert(net.network());
                 u128::from(net.broadcast())
                     .checked_add(1)
                     .map(Ipv6Addr::from)
                     .map(|e| split_points_v6.insert(e));
+
+                if let Some(path) = &as_path {
+                    let entry = as_paths_v6.entry(net).or_default();
+                    for &origin in &origin_asns {
+                        entry.entry(origin).or_default().push(path.clone());
+                    }
+                }
             }
         }
     }
@@ -287,6 +374,8 @@ fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData 
     ParsedMrtData {
         prefix_map_v4,
         prefix_map_v6,
+        as_paths_v4,
+        as_paths_v6,
         split_points_v4,
         split_points_v6,
     }
@@ -345,5 +434,22 @@ mod tests {
         assert!(is_private_asn(4_294_967_294));
         assert!(!is_private_asn(64511));
         assert!(!is_private_asn(13335));
+    }
+
+    #[test]
+    fn computes_longest_common_suffix() {
+        let paths = vec![
+            SmallVec::from_vec(vec![1, 64512, 13335, 15169]),
+            SmallVec::from_vec(vec![64500, 64512, 13335, 15169]),
+            SmallVec::from_vec(vec![64501, 9999, 13335, 15169]),
+        ];
+        assert_eq!(longest_common_suffix(&paths).as_slice(), &[13335, 15169]);
+
+        // limited to the last 4 elements
+        let long_paths = vec![SmallVec::from_vec(vec![10, 20, 30, 40, 50, 60])];
+        assert_eq!(
+            longest_common_suffix(&long_paths).as_slice(),
+            &[30, 40, 50, 60]
+        );
     }
 }
