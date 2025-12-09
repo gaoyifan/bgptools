@@ -6,6 +6,7 @@ authors = ["Yifan Gao <git@yfgao.com>"]
 description = "BGP rib data analysing"
 repository = "https://github.com/gaoyifan/bgptools"
 license = "MIT"
+exclude = ["docs/"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
