@@ -43,6 +43,9 @@ struct Opts {
     ignore_private_asn: bool,
 
     #[arg(long, default_value_t = false)]
+    origin_only: bool,
+
+    #[arg(long, default_value_t = false)]
     cache: bool,
 }
 
@@ -51,16 +54,18 @@ fn main() {
         mrt_files,
         asns,
         ignore_private_asn,
+        origin_only,
         cache,
     } = Opts::parse();
     let asn_list: HashSet<u32> = asns.into_iter().collect();
 
     let (asn_ranges_v4, asn_ranges_v6) = if cache {
-        let cache_path = cache_path(&mrt_files, ignore_private_asn);
-        load_cache(&cache_path, ignore_private_asn).unwrap_or_else(|| {
-            let (v4, v6) = build_asn_ranges(&mrt_files, ignore_private_asn);
+        let cache_path = cache_path(&mrt_files, ignore_private_asn, origin_only);
+        load_cache(&cache_path, ignore_private_asn, origin_only).unwrap_or_else(|| {
+            let (v4, v6) = build_asn_ranges(&mrt_files, ignore_private_asn, origin_only);
             let cached = CachedRanges {
                 ignore_private_asn,
+                origin_only,
                 v4,
                 v6,
             };
@@ -68,7 +73,7 @@ fn main() {
             (v4, v6)
         })
     } else {
-        build_asn_ranges(&mrt_files, ignore_private_asn)
+        build_asn_ranges(&mrt_files, ignore_private_asn, origin_only)
     };
 
     let mut result_v4: IpRange<Ipv4Net> = IpRange::new();
@@ -155,11 +160,12 @@ where
 #[derive(Serialize, Deserialize)]
 struct CachedRanges {
     ignore_private_asn: bool,
+    origin_only: bool,
     v4: AsnRangesV4,
     v6: AsnRangesV6,
 }
 
-fn cache_path(mrt_files: &[PathBuf], ignore_private_asn: bool) -> PathBuf {
+fn cache_path(mrt_files: &[PathBuf], ignore_private_asn: bool, origin_only: bool) -> PathBuf {
     let mut sources: Vec<String> = mrt_files
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
@@ -168,16 +174,21 @@ fn cache_path(mrt_files: &[PathBuf], ignore_private_asn: bool) -> PathBuf {
 
     let mut hasher = DefaultHasher::new();
     ignore_private_asn.hash(&mut hasher);
+    origin_only.hash(&mut hasher);
     sources.hash(&mut hasher);
     let hash = hasher.finish();
     PathBuf::from(format!("cache-{hash:016x}.bin"))
 }
 
-fn load_cache(path: &Path, ignore_private_asn: bool) -> Option<(AsnRangesV4, AsnRangesV6)> {
+fn load_cache(
+    path: &Path,
+    ignore_private_asn: bool,
+    origin_only: bool,
+) -> Option<(AsnRangesV4, AsnRangesV6)> {
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
     let cache: CachedRanges = bincode::deserialize_from(reader).ok()?;
-    if cache.ignore_private_asn == ignore_private_asn {
+    if cache.ignore_private_asn == ignore_private_asn && cache.origin_only == origin_only {
         Some((cache.v4, cache.v6))
     } else {
         None
@@ -192,7 +203,11 @@ fn save_cache(path: &Path, cache: CachedRanges) -> CachedRanges {
     cache
 }
 
-fn build_asn_ranges(mrt_files: &[PathBuf], ignore_private_asn: bool) -> (AsnRangesV4, AsnRangesV6) {
+fn build_asn_ranges(
+    mrt_files: &[PathBuf],
+    ignore_private_asn: bool,
+    origin_only: bool,
+) -> (AsnRangesV4, AsnRangesV6) {
     // Step 1: parse each MRT file in parallel
     let parsed: Vec<ParsedMrtData> = mrt_files
         .par_iter()
@@ -234,20 +249,22 @@ fn build_asn_ranges(mrt_files: &[PathBuf], ignore_private_asn: bool) -> (AsnRang
     let split_points_v4: Vec<Ipv4Addr> = split_points_v4_set.into_iter().collect();
     let split_points_v6: Vec<Ipv6Addr> = split_points_v6_set.into_iter().collect();
 
-    // Incorporate shared upstream ASNs (longest common suffix) across all MRT files
-    for (net, origins) in as_paths_v4 {
-        let entry = prefix_map_v4.entry(net).or_default();
-        for (_origin, paths) in origins {
-            let shared_upstreams = longest_common_suffix(&paths);
-            entry.extend(shared_upstreams);
+    if !origin_only {
+        // Incorporate shared upstream ASNs (longest common suffix) across all MRT files
+        for (net, origins) in as_paths_v4 {
+            let entry = prefix_map_v4.entry(net).or_default();
+            for (_origin, paths) in origins {
+                let shared_upstreams = longest_common_suffix(&paths);
+                entry.extend(shared_upstreams);
+            }
         }
-    }
 
-    for (net, origins) in as_paths_v6 {
-        let entry = prefix_map_v6.entry(net).or_default();
-        for (_origin, paths) in origins {
-            let shared_upstreams = longest_common_suffix(&paths);
-            entry.extend(shared_upstreams);
+        for (net, origins) in as_paths_v6 {
+            let entry = prefix_map_v6.entry(net).or_default();
+            for (_origin, paths) in origins {
+                let shared_upstreams = longest_common_suffix(&paths);
+                entry.extend(shared_upstreams);
+            }
         }
     }
 
@@ -450,6 +467,15 @@ mod tests {
         assert_eq!(
             longest_common_suffix(&long_paths).as_slice(),
             &[30, 40, 50, 60]
+        );
+    }
+
+    #[test]
+    fn cache_path_changes_when_origin_only_changes() {
+        let mrt_files = vec![PathBuf::from("rib-a.gz"), PathBuf::from("rib-b.gz")];
+        assert_ne!(
+            cache_path(&mrt_files, false, false),
+            cache_path(&mrt_files, false, true)
         );
     }
 }
