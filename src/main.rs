@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::DefaultHasher};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use smallvec::SmallVec;
@@ -16,12 +16,15 @@ use vec_collections::VecSet;
 
 type AsnRangesV4 = HashMap<u32, IpRange<Ipv4Net>>;
 type AsnRangesV6 = HashMap<u32, IpRange<Ipv6Net>>;
+type DirectUpstreams = HashMap<u32, BTreeSet<u32>>;
+const CACHE_FORMAT_VERSION: u8 = 2;
 
 struct ParsedMrtData {
     prefix_map_v4: PrefixMap<Ipv4Net, VecSet<[u32; 4]>>,
     prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>>,
     as_paths_v4: HashMap<Ipv4Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>>,
     as_paths_v6: HashMap<Ipv6Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>>,
+    direct_upstreams: DirectUpstreams,
     split_points_v4: BTreeSet<Ipv4Addr>,
     split_points_v6: BTreeSet<Ipv6Addr>,
 }
@@ -47,6 +50,18 @@ struct Opts {
 
     #[arg(long, default_value_t = false)]
     cache: bool,
+
+    #[arg(long, value_name = "COUNTRY")]
+    exclude_foreign_upstream_only: Option<String>,
+
+    #[arg(long, value_name = "FILE")]
+    asn_country_file: Option<PathBuf>,
+
+    #[arg(long, hide = true, default_value_t = false)]
+    debug_print_foreign_upstream_only_asns: bool,
+
+    #[arg(long, hide = true, default_value_t = false)]
+    debug_print_seen_origin_asns: bool,
 }
 
 fn main() {
@@ -56,31 +71,84 @@ fn main() {
         ignore_private_asn,
         origin_only,
         cache,
+        exclude_foreign_upstream_only,
+        asn_country_file,
+        debug_print_foreign_upstream_only_asns,
+        debug_print_seen_origin_asns,
     } = Opts::parse();
     let asn_list: HashSet<u32> = asns.into_iter().collect();
 
-    let (asn_ranges_v4, asn_ranges_v6) = if cache {
+    let AsnData {
+        v4: asn_ranges_v4,
+        v6: asn_ranges_v6,
+        direct_upstreams,
+    } = if cache {
         let cache_path = cache_path(&mrt_files, ignore_private_asn, origin_only);
         load_cache(&cache_path, ignore_private_asn, origin_only).unwrap_or_else(|| {
-            let (v4, v6) = build_asn_ranges(&mrt_files, ignore_private_asn, origin_only);
+            let data = build_asn_data(&mrt_files, ignore_private_asn, origin_only);
             let cached = CachedRanges {
+                version: CACHE_FORMAT_VERSION,
                 ignore_private_asn,
                 origin_only,
-                v4,
-                v6,
+                data,
             };
-            let CachedRanges { v4, v6, .. } = save_cache(&cache_path, cached);
-            (v4, v6)
+            save_cache(&cache_path, cached).data
         })
     } else {
-        build_asn_ranges(&mrt_files, ignore_private_asn, origin_only)
+        build_asn_data(&mrt_files, ignore_private_asn, origin_only)
     };
+
+    let foreign_upstream_only_asns = match exclude_foreign_upstream_only.as_deref() {
+        Some(country) => {
+            let asn_country_file = asn_country_file
+                .as_deref()
+                .expect("--asn-country-file is required with --exclude-foreign-upstream-only");
+            let asn_countries = load_asn_countries(asn_country_file).unwrap_or_else(|err| {
+                panic!(
+                    "failed to load ASN country data from {}: {err}",
+                    asn_country_file.display()
+                )
+            });
+            foreign_upstream_only_asns(&asn_list, &direct_upstreams, &asn_countries, country)
+        }
+        None => {
+            assert!(
+                !debug_print_foreign_upstream_only_asns,
+                "--debug-print-foreign-upstream-only-asns requires --exclude-foreign-upstream-only"
+            );
+            Vec::new()
+        }
+    };
+
+    if debug_print_foreign_upstream_only_asns {
+        for asn in foreign_upstream_only_asns {
+            println!("{asn}");
+        }
+        return;
+    }
+
+    if debug_print_seen_origin_asns {
+        let mut seen_asns: Vec<u32> = asn_list
+            .iter()
+            .copied()
+            .filter(|asn| asn_ranges_v4.contains_key(asn) || asn_ranges_v6.contains_key(asn))
+            .collect();
+        seen_asns.sort_unstable();
+        for asn in seen_asns {
+            println!("{asn}");
+        }
+        return;
+    }
+    let excluded_asns: HashSet<u32> = foreign_upstream_only_asns.into_iter().collect();
 
     let mut result_v4: IpRange<Ipv4Net> = IpRange::new();
     let mut result_v6: IpRange<Ipv6Net> = IpRange::new();
 
     // Step 5: Filter and merge IP ranges for target ASNs
     for asn in &asn_list {
+        if excluded_asns.contains(asn) {
+            continue;
+        }
         if let Some(range) = asn_ranges_v4.get(asn) {
             for net in range.iter() {
                 result_v4.add(net);
@@ -146,6 +214,21 @@ fn longest_common_suffix(paths: &[SmallVec<[u32; 4]>]) -> SmallVec<[u32; 4]> {
     suffix
 }
 
+fn normalize_as_path(path: &[u32]) -> SmallVec<[u32; 4]> {
+    let mut deduped: SmallVec<[u32; 4]> = SmallVec::new();
+    for &asn in path {
+        if deduped.last().copied() != Some(asn) {
+            deduped.push(asn);
+        }
+    }
+    if deduped.len() > 4 {
+        let len = deduped.len();
+        SmallVec::from_slice(&deduped[len.saturating_sub(4)..])
+    } else {
+        deduped
+    }
+}
+
 fn emit_sorted<N>(range: &IpRange<N>)
 where
     N: IpRangeNet + ToNetwork<N> + Clone + Ord + std::fmt::Display,
@@ -158,11 +241,18 @@ where
 }
 
 #[derive(Serialize, Deserialize)]
-struct CachedRanges {
-    ignore_private_asn: bool,
-    origin_only: bool,
+struct AsnData {
     v4: AsnRangesV4,
     v6: AsnRangesV6,
+    direct_upstreams: DirectUpstreams,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedRanges {
+    version: u8,
+    ignore_private_asn: bool,
+    origin_only: bool,
+    data: AsnData,
 }
 
 fn cache_path(mrt_files: &[PathBuf], ignore_private_asn: bool, origin_only: bool) -> PathBuf {
@@ -173,6 +263,7 @@ fn cache_path(mrt_files: &[PathBuf], ignore_private_asn: bool, origin_only: bool
     sources.sort();
 
     let mut hasher = DefaultHasher::new();
+    CACHE_FORMAT_VERSION.hash(&mut hasher);
     ignore_private_asn.hash(&mut hasher);
     origin_only.hash(&mut hasher);
     sources.hash(&mut hasher);
@@ -184,12 +275,15 @@ fn load_cache(
     path: &Path,
     ignore_private_asn: bool,
     origin_only: bool,
-) -> Option<(AsnRangesV4, AsnRangesV6)> {
+) -> Option<AsnData> {
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
     let cache: CachedRanges = bincode::deserialize_from(reader).ok()?;
-    if cache.ignore_private_asn == ignore_private_asn && cache.origin_only == origin_only {
-        Some((cache.v4, cache.v6))
+    if cache.version == CACHE_FORMAT_VERSION
+        && cache.ignore_private_asn == ignore_private_asn
+        && cache.origin_only == origin_only
+    {
+        Some(cache.data)
     } else {
         None
     }
@@ -203,11 +297,11 @@ fn save_cache(path: &Path, cache: CachedRanges) -> CachedRanges {
     cache
 }
 
-fn build_asn_ranges(
+fn build_asn_data(
     mrt_files: &[PathBuf],
     ignore_private_asn: bool,
     origin_only: bool,
-) -> (AsnRangesV4, AsnRangesV6) {
+) -> AsnData {
     // Step 1: parse each MRT file in parallel
     let parsed: Vec<ParsedMrtData> = mrt_files
         .par_iter()
@@ -219,6 +313,7 @@ fn build_asn_ranges(
     let mut prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>> = PrefixMap::new();
     let mut as_paths_v4: HashMap<Ipv4Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
     let mut as_paths_v6: HashMap<Ipv6Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
+    let mut direct_upstreams: DirectUpstreams = HashMap::new();
     let mut split_points_v4_set: BTreeSet<Ipv4Addr> = BTreeSet::new();
     let mut split_points_v6_set: BTreeSet<Ipv6Addr> = BTreeSet::new();
 
@@ -240,6 +335,12 @@ fn build_asn_ranges(
             for (origin, paths) in origins {
                 entry.entry(origin).or_default().extend(paths);
             }
+        }
+        for (origin, upstreams) in data.direct_upstreams {
+            direct_upstreams
+                .entry(origin)
+                .or_default()
+                .extend(upstreams);
         }
         split_points_v4_set.extend(data.split_points_v4);
         split_points_v6_set.extend(data.split_points_v6);
@@ -312,7 +413,11 @@ fn build_asn_ranges(
         }
     }
 
-    (asn_ranges_v4, asn_ranges_v6)
+    AsnData {
+        v4: asn_ranges_v4,
+        v6: asn_ranges_v6,
+        direct_upstreams,
+    }
 }
 
 fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData {
@@ -324,6 +429,7 @@ fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData 
     let mut prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>> = PrefixMap::new();
     let mut as_paths_v4: HashMap<Ipv4Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
     let mut as_paths_v6: HashMap<Ipv6Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
+    let mut direct_upstreams: DirectUpstreams = HashMap::new();
     let mut split_points_v4: BTreeSet<Ipv4Addr> = BTreeSet::new();
     let mut split_points_v6: BTreeSet<Ipv6Addr> = BTreeSet::new();
 
@@ -346,13 +452,17 @@ fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData 
             .as_path
             .as_ref()
             .and_then(|path| path.to_u32_vec_opt(false))
-            .map(|mut path| {
-                if path.len() > 4 {
-                    let len = path.len();
-                    path = path[len.saturating_sub(4)..].to_vec();
+            .map(|path| normalize_as_path(&path));
+
+        if let Some(path) = &as_path {
+            if let Some(&upstream) = path.iter().rev().nth(1) {
+                if !is_private_asn(upstream) {
+                    for &origin in &origin_asns {
+                        direct_upstreams.entry(origin).or_default().insert(upstream);
+                    }
                 }
-                SmallVec::from_vec(path)
-            });
+            }
+        }
 
         match elem.prefix.prefix {
             IpNet::V4(net) => {
@@ -393,9 +503,64 @@ fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData 
         prefix_map_v6,
         as_paths_v4,
         as_paths_v6,
+        direct_upstreams,
         split_points_v4,
         split_points_v6,
     }
+}
+
+fn parse_asn_country(line: &str) -> Option<(u32, &str)> {
+    let line = line.trim_end();
+    let (asn_part, country) = line.rsplit_once(',')?;
+    let country = country.trim();
+    let asn = asn_part
+        .strip_prefix("AS")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    if country.len() == 2 {
+        Some((asn, country))
+    } else {
+        None
+    }
+}
+
+fn load_asn_countries(path: &Path) -> std::io::Result<HashMap<u32, String>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut countries = HashMap::new();
+    for line in reader.lines() {
+        let line = line?;
+        if let Some((asn, country)) = parse_asn_country(&line) {
+            countries.insert(asn, country.to_ascii_uppercase());
+        }
+    }
+    Ok(countries)
+}
+
+fn foreign_upstream_only_asns(
+    target_asns: &HashSet<u32>,
+    direct_upstreams: &DirectUpstreams,
+    asn_countries: &HashMap<u32, String>,
+    country: &str,
+) -> Vec<u32> {
+    let country = country.to_ascii_uppercase();
+    let mut matches: Vec<u32> = target_asns
+        .iter()
+        .copied()
+        .filter(|asn| {
+            let Some(upstreams) = direct_upstreams.get(asn) else {
+                return false;
+            };
+            !upstreams.is_empty()
+                && upstreams.iter().all(|upstream| {
+                    matches!(asn_countries.get(upstream), Some(upstream_country) if upstream_country != &country)
+                })
+        })
+        .collect();
+    matches.sort_unstable();
+    matches
 }
 
 #[cfg(test)]
@@ -471,11 +636,51 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_as_path_before_upstream_detection() {
+        assert_eq!(
+            normalize_as_path(&[2914, 20473, 139589, 139589]).as_slice(),
+            &[2914, 20473, 139589]
+        );
+        assert_eq!(
+            normalize_as_path(&[1, 2, 3, 4, 5, 5]).as_slice(),
+            &[2, 3, 4, 5]
+        );
+    }
+
+    #[test]
     fn cache_path_changes_when_origin_only_changes() {
         let mrt_files = vec![PathBuf::from("rib-a.gz"), PathBuf::from("rib-b.gz")];
         assert_ne!(
             cache_path(&mrt_files, false, false),
             cache_path(&mrt_files, false, true)
+        );
+    }
+
+    #[test]
+    fn parses_asn_country_lines() {
+        assert_eq!(parse_asn_country("AS4134 CHINANET-BACKBONE, CN"), Some((4134, "CN")));
+        assert_eq!(parse_asn_country("AS15169 GOOGLE, US"), Some((15169, "US")));
+        assert_eq!(parse_asn_country("invalid"), None);
+    }
+
+    #[test]
+    fn detects_foreign_upstream_only_asns() {
+        let target_asns = HashSet::from([1, 2, 3, 4]);
+        let direct_upstreams = HashMap::from([
+            (1, BTreeSet::from([100, 101])),
+            (2, BTreeSet::from([100, 102])),
+            (3, BTreeSet::from([200])),
+            (4, BTreeSet::new()),
+        ]);
+        let asn_countries = HashMap::from([
+            (100, "US".to_string()),
+            (101, "JP".to_string()),
+            (102, "CN".to_string()),
+        ]);
+
+        assert_eq!(
+            foreign_upstream_only_asns(&target_asns, &direct_upstreams, &asn_countries, "CN"),
+            vec![1]
         );
     }
 }
