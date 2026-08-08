@@ -2,7 +2,7 @@
 
 `bgptools` reads one or more MRT/RIB files and outputs the IPv4/IPv6 prefixes originated by the ASNs provided on the command line.
 
-- Inputs: MRT file paths (`--mrt-file`), target ASNs (positional), `--ignore-private-asn`, `--origin-only`, `--cache`, and an optional foreign-upstream filter (`--exclude-foreign-upstream-only` + `--asn-country-file`).
+- Inputs: MRT file paths (`--mrt-file`), target ASNs (positional), `--ignore-private-asn`, `--origin-only`, `--cache`, an optional foreign-upstream filter (`--exclude-foreign-upstream-only` + `--asn-country-file`), and an optional trusted-CN-transit filter (`--trusted-cn-transit-file` + `--asn-country-file`, requires `--origin-only`).
 - Output: Simplified, sorted list of CIDR prefixes (v4 then v6) for the requested ASNs.
 
 ## Processing Steps
@@ -21,21 +21,24 @@
 2) **Merge per-file data**  
    Parsed structures are merged across files. Split points are deduped and sorted (via `BTreeSet`).
 
-3) **Add shared upstream ASNs**  
+3) **Optional trusted-CN-transit filtering**
+   With `--origin-only`, inspect every observed AS path from the origin side. An origin ASN is retained, along with all of its prefixes, when at least one path has a contiguous CN suffix containing an ASN from `--trusted-cn-transit-file`. Inspection stops at the first non-CN or unknown ASN, so a trusted CN network beyond foreign transit does not make the origin domestic. The CLI rejects this filter without `--origin-only` because shared-upstream attribution is a different mode.
+
+4) **Add shared upstream ASNs**
    Unless `--origin-only` is set, the algorithm computes the longest common suffix of the collected AS paths (capped to 4 ASNs). These shared upstream ASNs are added to the prefix map so they are treated like origin ASNs for interval attribution.
 
-4) **Build ASN → IP ranges**  
+5) **Build ASN → IP ranges**
    Consecutive split points define half-open intervals `[start, end)`. For each interval, a /32 (v4) or /128 (v6) lookup finds the longest covering prefix and its ASNs. Each ASN receives the interval, converted to a minimal set of CIDRs via `interval_to_cidrs_v4/v6`. The per-AS ranges are stored as `IpRange` structures to allow merging.
 
-5) **Optional foreign-upstream filtering**  
+6) **Optional foreign-upstream filtering**
    When `--exclude-foreign-upstream-only <COUNTRY>` is enabled, bgptools loads ASN → country data from `--asn-country-file` and removes any requested ASN whose observed direct upstream ASNs are all known and all outside `<COUNTRY>`. A hidden debug flag can print this matched ASN list directly.
 
-6) **Finalize result**  
+7) **Finalize result**
    For the remaining requested ASNs, the collected ranges are merged and simplified, then emitted in sorted order (v4 then v6).
 
 ## Caching
 
-When `--cache` is enabled, the computed ASN→range maps and origin→direct-upstream map are serialized to a bincode file keyed by input file list, `ignore_private_asn`, and `origin_only`. Subsequent runs reuse the cache when the key matches.
+When `--cache` is enabled, the computed ASN→range maps and origin→direct-upstream map are serialized to a bincode file keyed by input file list, `ignore_private_asn`, `origin_only`, and the trusted-transit policy fingerprint. Subsequent runs reuse the cache when the key matches.
 
 ## Key Functions (in `src/main.rs`)
 
@@ -43,4 +46,5 @@ When `--cache` is enabled, the computed ASN→range maps and origin→direct-ups
 - `longest_common_suffix`: Finds shared tail of AS paths (≤4 hops).
 - `interval_to_cidrs_v4/v6`: Converts `[start, end)` intervals to minimal CIDR cover.
 - `foreign_upstream_only_asns`: Computes which target ASNs have only foreign direct upstreams.
+- `has_domestic_suffix`: Checks whether an AS path has a contiguous CN origin-side suffix containing trusted transit.
 - `build_asn_data`: Orchestrates merging, shared-upstream attribution, interval slicing, and ASN range construction.

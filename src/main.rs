@@ -5,25 +5,31 @@ use iprange::{IpNet as IpRangeNet, IpRange, ToNetwork};
 use prefix_trie::PrefixMap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::DefaultHasher};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
-use smallvec::SmallVec;
 use vec_collections::VecSet;
 
 type AsnRangesV4 = HashMap<u32, IpRange<Ipv4Net>>;
 type AsnRangesV6 = HashMap<u32, IpRange<Ipv6Net>>;
 type DirectUpstreams = HashMap<u32, BTreeSet<u32>>;
-const CACHE_FORMAT_VERSION: u8 = 2;
+const CACHE_FORMAT_VERSION: u8 = 3;
+
+struct DomesticPolicy {
+    trusted_transit_asns: HashSet<u32>,
+    asn_countries: HashMap<u32, String>,
+}
 
 struct ParsedMrtData {
     prefix_map_v4: PrefixMap<Ipv4Net, VecSet<[u32; 4]>>,
     prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>>,
     as_paths_v4: HashMap<Ipv4Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>>,
     as_paths_v6: HashMap<Ipv6Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>>,
+    domestic_origins: HashSet<u32>,
     direct_upstreams: DirectUpstreams,
     split_points_v4: BTreeSet<Ipv4Addr>,
     split_points_v6: BTreeSet<Ipv6Addr>,
@@ -57,6 +63,14 @@ struct Opts {
     #[arg(long, value_name = "FILE")]
     asn_country_file: Option<PathBuf>,
 
+    #[arg(
+        long,
+        hide = true,
+        value_name = "FILE",
+        requires_all = ["origin_only", "asn_country_file"]
+    )]
+    trusted_cn_transit_file: Option<PathBuf>,
+
     #[arg(long, hide = true, default_value_t = false)]
     debug_print_foreign_upstream_only_asns: bool,
 
@@ -73,29 +87,68 @@ fn main() {
         cache,
         exclude_foreign_upstream_only,
         asn_country_file,
+        trusted_cn_transit_file,
         debug_print_foreign_upstream_only_asns,
         debug_print_seen_origin_asns,
     } = Opts::parse();
     let asn_list: HashSet<u32> = asns.into_iter().collect();
+    let domestic_policy = trusted_cn_transit_file.as_deref().map(|trusted_path| {
+        let country_path = asn_country_file
+            .as_deref()
+            .expect("--asn-country-file is required with --trusted-cn-transit-file");
+        DomesticPolicy {
+            trusted_transit_asns: load_asn_set(trusted_path)
+                .unwrap_or_else(|err| panic!("failed to load trusted CN transit ASNs: {err}")),
+            asn_countries: load_asn_countries(country_path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to load ASN country data from {}: {err}",
+                    country_path.display()
+                )
+            }),
+        }
+    });
+    let domestic_policy_fingerprint = domestic_policy.as_ref().map(domestic_policy_fingerprint);
 
     let AsnData {
         v4: asn_ranges_v4,
         v6: asn_ranges_v6,
         direct_upstreams,
     } = if cache {
-        let cache_path = cache_path(&mrt_files, ignore_private_asn, origin_only);
-        load_cache(&cache_path, ignore_private_asn, origin_only).unwrap_or_else(|| {
-            let data = build_asn_data(&mrt_files, ignore_private_asn, origin_only);
+        let cache_path = cache_path(
+            &mrt_files,
+            ignore_private_asn,
+            origin_only,
+            domestic_policy_fingerprint,
+        );
+        load_cache(
+            &cache_path,
+            ignore_private_asn,
+            origin_only,
+            domestic_policy_fingerprint,
+        )
+        .unwrap_or_else(|| {
+            let data = build_asn_data(
+                &mrt_files,
+                ignore_private_asn,
+                origin_only,
+                domestic_policy.as_ref(),
+            );
             let cached = CachedRanges {
                 version: CACHE_FORMAT_VERSION,
                 ignore_private_asn,
                 origin_only,
+                domestic_policy_fingerprint,
                 data,
             };
             save_cache(&cache_path, cached).data
         })
     } else {
-        build_asn_data(&mrt_files, ignore_private_asn, origin_only)
+        build_asn_data(
+            &mrt_files,
+            ignore_private_asn,
+            origin_only,
+            domestic_policy.as_ref(),
+        )
     };
 
     let foreign_upstream_only_asns = match exclude_foreign_upstream_only.as_deref() {
@@ -252,10 +305,16 @@ struct CachedRanges {
     version: u8,
     ignore_private_asn: bool,
     origin_only: bool,
+    domestic_policy_fingerprint: Option<u64>,
     data: AsnData,
 }
 
-fn cache_path(mrt_files: &[PathBuf], ignore_private_asn: bool, origin_only: bool) -> PathBuf {
+fn cache_path(
+    mrt_files: &[PathBuf],
+    ignore_private_asn: bool,
+    origin_only: bool,
+    domestic_policy_fingerprint: Option<u64>,
+) -> PathBuf {
     let mut sources: Vec<String> = mrt_files
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
@@ -266,6 +325,7 @@ fn cache_path(mrt_files: &[PathBuf], ignore_private_asn: bool, origin_only: bool
     CACHE_FORMAT_VERSION.hash(&mut hasher);
     ignore_private_asn.hash(&mut hasher);
     origin_only.hash(&mut hasher);
+    domestic_policy_fingerprint.hash(&mut hasher);
     sources.hash(&mut hasher);
     let hash = hasher.finish();
     PathBuf::from(format!("cache-{hash:016x}.bin"))
@@ -275,6 +335,7 @@ fn load_cache(
     path: &Path,
     ignore_private_asn: bool,
     origin_only: bool,
+    domestic_policy_fingerprint: Option<u64>,
 ) -> Option<AsnData> {
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
@@ -282,6 +343,7 @@ fn load_cache(
     if cache.version == CACHE_FORMAT_VERSION
         && cache.ignore_private_asn == ignore_private_asn
         && cache.origin_only == origin_only
+        && cache.domestic_policy_fingerprint == domestic_policy_fingerprint
     {
         Some(cache.data)
     } else {
@@ -301,11 +363,23 @@ fn build_asn_data(
     mrt_files: &[PathBuf],
     ignore_private_asn: bool,
     origin_only: bool,
+    domestic_policy: Option<&DomesticPolicy>,
 ) -> AsnData {
     // Step 1: parse each MRT file in parallel
     let parsed: Vec<ParsedMrtData> = mrt_files
         .par_iter()
-        .map(|mrt_file| process_mrt_file(mrt_file.as_path(), ignore_private_asn))
+        .map(|mrt_file| {
+            process_mrt_file(
+                mrt_file.as_path(),
+                ignore_private_asn,
+                !origin_only,
+                domestic_policy,
+            )
+        })
+        .collect();
+    let domestic_origins: HashSet<u32> = parsed
+        .iter()
+        .flat_map(|data| data.domestic_origins.iter().copied())
         .collect();
 
     // Step 2: merge prefix maps and split points
@@ -319,10 +393,26 @@ fn build_asn_data(
 
     for data in parsed {
         for (net, asns) in data.prefix_map_v4 {
-            prefix_map_v4.entry(net).or_default().extend(asns);
+            let entry = prefix_map_v4.entry(net).or_default();
+            if domestic_policy.is_some() {
+                entry.extend(
+                    asns.into_iter()
+                        .filter(|asn| domestic_origins.contains(asn)),
+                );
+            } else {
+                entry.extend(asns);
+            }
         }
         for (net, asns) in data.prefix_map_v6 {
-            prefix_map_v6.entry(net).or_default().extend(asns);
+            let entry = prefix_map_v6.entry(net).or_default();
+            if domestic_policy.is_some() {
+                entry.extend(
+                    asns.into_iter()
+                        .filter(|asn| domestic_origins.contains(asn)),
+                );
+            } else {
+                entry.extend(asns);
+            }
         }
         for (net, origins) in data.as_paths_v4 {
             let entry = as_paths_v4.entry(net).or_default();
@@ -420,7 +510,35 @@ fn build_asn_data(
     }
 }
 
-fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData {
+fn has_domestic_suffix(path: &[u32], domestic_policy: &DomesticPolicy) -> bool {
+    path.iter()
+        .rev()
+        .take_while(|asn| domestic_policy.asn_countries.get(asn).map(String::as_str) == Some("CN"))
+        .any(|asn| domestic_policy.trusted_transit_asns.contains(asn))
+}
+
+fn domestic_policy_fingerprint(domestic_policy: &DomesticPolicy) -> u64 {
+    let mut trusted: Vec<u32> = domestic_policy
+        .trusted_transit_asns
+        .iter()
+        .copied()
+        .collect();
+    trusted.sort_unstable();
+    let mut countries: Vec<(&u32, &String)> = domestic_policy.asn_countries.iter().collect();
+    countries.sort_unstable_by_key(|(asn, _)| **asn);
+
+    let mut hasher = DefaultHasher::new();
+    trusted.hash(&mut hasher);
+    countries.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn process_mrt_file(
+    mrt_file: &Path,
+    ignore_private_asn: bool,
+    collect_as_paths: bool,
+    domestic_policy: Option<&DomesticPolicy>,
+) -> ParsedMrtData {
     let rib_path = mrt_file.to_string_lossy().into_owned();
     let parser = BgpkitParser::new(rib_path.as_str())
         .unwrap_or_else(|_| panic!("failed to open MRT/RIB file {rib_path} with bgpkit"));
@@ -429,6 +547,7 @@ fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData 
     let mut prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>> = PrefixMap::new();
     let mut as_paths_v4: HashMap<Ipv4Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
     let mut as_paths_v6: HashMap<Ipv6Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
+    let mut domestic_origins: HashSet<u32> = HashSet::new();
     let mut direct_upstreams: DirectUpstreams = HashMap::new();
     let mut split_points_v4: BTreeSet<Ipv4Addr> = BTreeSet::new();
     let mut split_points_v6: BTreeSet<Ipv6Addr> = BTreeSet::new();
@@ -448,11 +567,26 @@ fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData 
         }
 
         let origin_asns: HashSet<u32> = origins.iter().map(|asn| asn.to_u32()).collect();
-        let as_path: Option<SmallVec<[u32; 4]>> = elem
+        let full_as_path: Option<Vec<u32>> = elem
             .as_path
             .as_ref()
             .and_then(|path| path.to_u32_vec_opt(false))
-            .map(|path| normalize_as_path(&path));
+            .map(|path| {
+                path.into_iter().fold(Vec::new(), |mut normalized, asn| {
+                    if normalized.last().copied() != Some(asn) {
+                        normalized.push(asn);
+                    }
+                    normalized
+                })
+            });
+        let as_path = full_as_path.as_deref().map(normalize_as_path);
+        let has_trusted_cn_transit = match (full_as_path.as_deref(), domestic_policy) {
+            (Some(path), Some(policy)) => has_domestic_suffix(path, policy),
+            _ => false,
+        };
+        if has_trusted_cn_transit {
+            domestic_origins.extend(origin_asns.iter().copied());
+        }
 
         if let Some(path) = &as_path {
             if let Some(&upstream) = path.iter().rev().nth(1) {
@@ -466,14 +600,17 @@ fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData 
 
         match elem.prefix.prefix {
             IpNet::V4(net) => {
-                prefix_map_v4.entry(net).or_default().extend(origin_asns.iter().copied());
+                prefix_map_v4
+                    .entry(net)
+                    .or_default()
+                    .extend(origin_asns.iter().copied());
                 split_points_v4.insert(net.network());
                 u32::from(net.broadcast())
                     .checked_add(1)
                     .map(Ipv4Addr::from)
                     .map(|e| split_points_v4.insert(e));
 
-                if let Some(path) = &as_path {
+                if collect_as_paths && let Some(path) = &as_path {
                     let entry = as_paths_v4.entry(net).or_default();
                     for &origin in &origin_asns {
                         entry.entry(origin).or_default().push(path.clone());
@@ -481,14 +618,17 @@ fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData 
                 }
             }
             IpNet::V6(net) => {
-                prefix_map_v6.entry(net).or_default().extend(origin_asns.iter().copied());
+                prefix_map_v6
+                    .entry(net)
+                    .or_default()
+                    .extend(origin_asns.iter().copied());
                 split_points_v6.insert(net.network());
                 u128::from(net.broadcast())
                     .checked_add(1)
                     .map(Ipv6Addr::from)
                     .map(|e| split_points_v6.insert(e));
 
-                if let Some(path) = &as_path {
+                if collect_as_paths && let Some(path) = &as_path {
                     let entry = as_paths_v6.entry(net).or_default();
                     for &origin in &origin_asns {
                         entry.entry(origin).or_default().push(path.clone());
@@ -503,6 +643,7 @@ fn process_mrt_file(mrt_file: &Path, ignore_private_asn: bool) -> ParsedMrtData 
         prefix_map_v6,
         as_paths_v4,
         as_paths_v6,
+        domestic_origins,
         direct_upstreams,
         split_points_v4,
         split_points_v6,
@@ -537,6 +678,20 @@ fn load_asn_countries(path: &Path) -> std::io::Result<HashMap<u32, String>> {
         }
     }
     Ok(countries)
+}
+
+fn load_asn_set(path: &Path) -> std::io::Result<HashSet<u32>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    reader
+        .lines()
+        .map(|line| {
+            line?
+                .trim()
+                .parse()
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        })
+        .collect()
 }
 
 fn foreign_upstream_only_asns(
@@ -651,14 +806,101 @@ mod tests {
     fn cache_path_changes_when_origin_only_changes() {
         let mrt_files = vec![PathBuf::from("rib-a.gz"), PathBuf::from("rib-b.gz")];
         assert_ne!(
-            cache_path(&mrt_files, false, false),
-            cache_path(&mrt_files, false, true)
+            cache_path(&mrt_files, false, false, None),
+            cache_path(&mrt_files, false, true, None)
         );
     }
 
     #[test]
+    fn cache_path_changes_with_domestic_policy() {
+        let mrt_files = vec![PathBuf::from("rib-a.gz")];
+        assert_ne!(
+            cache_path(&mrt_files, false, true, None),
+            cache_path(&mrt_files, false, true, Some(1))
+        );
+        assert_ne!(
+            cache_path(&mrt_files, false, true, Some(1)),
+            cache_path(&mrt_files, false, true, Some(2))
+        );
+    }
+
+    #[test]
+    fn detects_trusted_transit_in_contiguous_cn_suffix() {
+        let policy = DomesticPolicy {
+            trusted_transit_asns: HashSet::from([4538, 7497]),
+            asn_countries: HashMap::from([
+                (24489, "CN".to_string()),
+                (23911, "CN".to_string()),
+                (4538, "CN".to_string()),
+                (38345, "CN".to_string()),
+                (7497, "CN".to_string()),
+                (6939, "US".to_string()),
+            ]),
+        };
+
+        assert!(has_domestic_suffix(&[6939, 4538, 23911, 24489], &policy));
+        assert!(has_domestic_suffix(&[6939, 7497, 38345], &policy));
+        assert!(!has_domestic_suffix(&[4538, 6939, 24489], &policy));
+        assert!(!has_domestic_suffix(&[4538, 64500, 24489], &policy));
+    }
+
+    #[test]
+    fn trusted_transit_filter_requires_origin_only_and_country_data() {
+        assert!(
+            Opts::try_parse_from([
+                "bgptools",
+                "--asn-country-file",
+                "countries.txt",
+                "--trusted-cn-transit-file",
+                "trusted.txt",
+                "1",
+            ])
+            .is_err()
+        );
+        assert!(
+            Opts::try_parse_from([
+                "bgptools",
+                "--origin-only",
+                "--trusted-cn-transit-file",
+                "trusted.txt",
+                "1",
+            ])
+            .is_err()
+        );
+        assert!(
+            Opts::try_parse_from([
+                "bgptools",
+                "--origin-only",
+                "--asn-country-file",
+                "countries.txt",
+                "--trusted-cn-transit-file",
+                "trusted.txt",
+                "1",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_filtered_prefix_blocks_aggregate_fallback() {
+        let mut prefixes: PrefixMap<Ipv4Net, VecSet<[u32; 4]>> = PrefixMap::new();
+        prefixes
+            .entry("10.0.0.0/8".parse().unwrap())
+            .or_default()
+            .extend([4134]);
+        prefixes.entry("10.1.2.0/24".parse().unwrap()).or_default();
+
+        let lookup = "10.1.2.1/32".parse().unwrap();
+        let (_, origins) = prefixes.get_lpm(&lookup).unwrap();
+        assert!(origins.is_empty());
+    }
+
+    #[test]
     fn parses_asn_country_lines() {
-        assert_eq!(parse_asn_country("AS4134 CHINANET-BACKBONE, CN"), Some((4134, "CN")));
+        assert_eq!(
+            parse_asn_country("AS4134 CHINANET-BACKBONE, CN"),
+            Some((4134, "CN"))
+        );
         assert_eq!(parse_asn_country("AS15169 GOOGLE, US"), Some((15169, "US")));
         assert_eq!(parse_asn_country("invalid"), None);
     }
