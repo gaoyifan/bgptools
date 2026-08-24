@@ -17,7 +17,7 @@ use vec_collections::VecSet;
 type AsnRangesV4 = HashMap<u32, IpRange<Ipv4Net>>;
 type AsnRangesV6 = HashMap<u32, IpRange<Ipv6Net>>;
 type DirectUpstreams = HashMap<u32, BTreeSet<u32>>;
-const CACHE_FORMAT_VERSION: u8 = 3;
+const CACHE_FORMAT_VERSION: u8 = 4;
 
 struct DomesticPolicy {
     trusted_transit_asns: HashSet<u32>,
@@ -27,6 +27,8 @@ struct DomesticPolicy {
 struct ParsedMrtData {
     prefix_map_v4: PrefixMap<Ipv4Net, VecSet<[u32; 4]>>,
     prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>>,
+    announced_v4: IpRange<Ipv4Net>,
+    announced_v6: IpRange<Ipv6Net>,
     as_paths_v4: HashMap<Ipv4Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>>,
     as_paths_v6: HashMap<Ipv6Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>>,
     domestic_origins: HashSet<u32>,
@@ -57,6 +59,9 @@ struct Opts {
     #[arg(long, default_value_t = false)]
     cache: bool,
 
+    #[arg(long, value_name = "FILE")]
+    fallback_prefix_file: Option<PathBuf>,
+
     #[arg(long, value_name = "COUNTRY")]
     exclude_foreign_upstream_only: Option<String>,
 
@@ -85,6 +90,7 @@ fn main() {
         ignore_private_asn,
         origin_only,
         cache,
+        fallback_prefix_file,
         exclude_foreign_upstream_only,
         asn_country_file,
         trusted_cn_transit_file,
@@ -112,6 +118,8 @@ fn main() {
     let AsnData {
         v4: asn_ranges_v4,
         v6: asn_ranges_v6,
+        announced_v4,
+        announced_v6,
         direct_upstreams,
     } = if cache {
         let cache_path = cache_path(
@@ -214,6 +222,25 @@ fn main() {
         }
     }
 
+    let fallback_prefixes = fallback_prefix_file
+        .as_deref()
+        .map(|path| {
+            load_prefixes(path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to load fallback prefixes from {}: {err}",
+                    path.display()
+                )
+            })
+        })
+        .unwrap_or_default();
+    apply_fallback_prefixes(
+        &mut result_v4,
+        &mut result_v6,
+        &announced_v4,
+        &announced_v6,
+        &fallback_prefixes,
+    );
+
     result_v4.simplify();
     result_v6.simplify();
 
@@ -282,6 +309,34 @@ fn normalize_as_path(path: &[u32]) -> SmallVec<[u32; 4]> {
     }
 }
 
+fn apply_fallback_prefixes(
+    result_v4: &mut IpRange<Ipv4Net>,
+    result_v6: &mut IpRange<Ipv6Net>,
+    announced_v4: &IpRange<Ipv4Net>,
+    announced_v6: &IpRange<Ipv6Net>,
+    fallback_prefixes: &[IpNet],
+) {
+    let mut fallback_v4 = IpRange::new();
+    let mut fallback_v6 = IpRange::new();
+    for prefix in fallback_prefixes {
+        match prefix {
+            IpNet::V4(net) => {
+                fallback_v4.add(*net);
+            }
+            IpNet::V6(net) => {
+                fallback_v6.add(*net);
+            }
+        }
+    }
+
+    for net in fallback_v4.exclude(announced_v4).iter() {
+        result_v4.add(net);
+    }
+    for net in fallback_v6.exclude(announced_v6).iter() {
+        result_v6.add(net);
+    }
+}
+
 fn emit_sorted<N>(range: &IpRange<N>)
 where
     N: IpRangeNet + ToNetwork<N> + Clone + Ord + std::fmt::Display,
@@ -297,6 +352,8 @@ where
 struct AsnData {
     v4: AsnRangesV4,
     v6: AsnRangesV6,
+    announced_v4: IpRange<Ipv4Net>,
+    announced_v6: IpRange<Ipv6Net>,
     direct_upstreams: DirectUpstreams,
 }
 
@@ -382,9 +439,11 @@ fn build_asn_data(
         .flat_map(|data| data.domestic_origins.iter().copied())
         .collect();
 
-    // Step 2: merge prefix maps and split points
+    // Step 2: merge prefix maps, announced ranges, and split points
     let mut prefix_map_v4: PrefixMap<Ipv4Net, VecSet<[u32; 4]>> = PrefixMap::new();
     let mut prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>> = PrefixMap::new();
+    let mut announced_v4: IpRange<Ipv4Net> = IpRange::new();
+    let mut announced_v6: IpRange<Ipv6Net> = IpRange::new();
     let mut as_paths_v4: HashMap<Ipv4Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
     let mut as_paths_v6: HashMap<Ipv6Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
     let mut direct_upstreams: DirectUpstreams = HashMap::new();
@@ -392,6 +451,12 @@ fn build_asn_data(
     let mut split_points_v6_set: BTreeSet<Ipv6Addr> = BTreeSet::new();
 
     for data in parsed {
+        for net in data.announced_v4.iter() {
+            announced_v4.add(net);
+        }
+        for net in data.announced_v6.iter() {
+            announced_v6.add(net);
+        }
         for (net, asns) in data.prefix_map_v4 {
             let entry = prefix_map_v4.entry(net).or_default();
             if domestic_policy.is_some() {
@@ -503,9 +568,14 @@ fn build_asn_data(
         }
     }
 
+    announced_v4.simplify();
+    announced_v6.simplify();
+
     AsnData {
         v4: asn_ranges_v4,
         v6: asn_ranges_v6,
+        announced_v4,
+        announced_v6,
         direct_upstreams,
     }
 }
@@ -545,6 +615,8 @@ fn process_mrt_file(
 
     let mut prefix_map_v4: PrefixMap<Ipv4Net, VecSet<[u32; 4]>> = PrefixMap::new();
     let mut prefix_map_v6: PrefixMap<Ipv6Net, VecSet<[u32; 4]>> = PrefixMap::new();
+    let mut announced_v4: IpRange<Ipv4Net> = IpRange::new();
+    let mut announced_v6: IpRange<Ipv6Net> = IpRange::new();
     let mut as_paths_v4: HashMap<Ipv4Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
     let mut as_paths_v6: HashMap<Ipv6Net, HashMap<u32, Vec<SmallVec<[u32; 4]>>>> = HashMap::new();
     let mut domestic_origins: HashSet<u32> = HashSet::new();
@@ -555,6 +627,17 @@ fn process_mrt_file(
     for elem in parser.into_elem_iter() {
         if !matches!(elem.elem_type, ElemType::ANNOUNCE) {
             continue;
+        }
+
+        if elem.prefix.prefix.prefix_len() > 0 {
+            match &elem.prefix.prefix {
+                IpNet::V4(net) => {
+                    announced_v4.add(*net);
+                }
+                IpNet::V6(net) => {
+                    announced_v6.add(*net);
+                }
+            }
         }
 
         let origins = match &elem.origin_asns {
@@ -638,9 +721,14 @@ fn process_mrt_file(
         }
     }
 
+    announced_v4.simplify();
+    announced_v6.simplify();
+
     ParsedMrtData {
         prefix_map_v4,
         prefix_map_v6,
+        announced_v4,
+        announced_v6,
         as_paths_v4,
         as_paths_v6,
         domestic_origins,
@@ -678,6 +766,19 @@ fn load_asn_countries(path: &Path) -> std::io::Result<HashMap<u32, String>> {
         }
     }
     Ok(countries)
+}
+
+fn load_prefixes(path: &Path) -> std::io::Result<Vec<IpNet>> {
+    let file = File::open(path)?;
+    BufReader::new(file)
+        .lines()
+        .map(|line| {
+            let line = line?;
+            line.trim()
+                .parse()
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+        })
+        .collect()
 }
 
 fn load_asn_set(path: &Path) -> std::io::Result<HashSet<u32>> {
@@ -893,6 +994,108 @@ mod tests {
         let lookup = "10.1.2.1/32".parse().unwrap();
         let (_, origins) = prefixes.get_lpm(&lookup).unwrap();
         assert!(origins.is_empty());
+    }
+
+    #[test]
+    fn fallback_completes_an_unannounced_half() {
+        let mut result_v4 = IpRange::new();
+        result_v4.add("121.46.0.0/19".parse().unwrap());
+        let mut announced_v4 = IpRange::new();
+        announced_v4.add("121.46.0.0/19".parse().unwrap());
+
+        apply_fallback_prefixes(
+            &mut result_v4,
+            &mut IpRange::new(),
+            &announced_v4,
+            &IpRange::new(),
+            &["121.46.0.0/18".parse().unwrap()],
+        );
+        result_v4.simplify();
+
+        assert_eq!(
+            result_v4
+                .iter()
+                .map(|net| net.to_string())
+                .collect::<Vec<_>>(),
+            ["121.46.0.0/18"]
+        );
+    }
+
+    #[test]
+    fn fallback_preserves_a_more_specific_announced_hole() {
+        let mut result_v4 = IpRange::new();
+        let mut announced_v4 = IpRange::new();
+        announced_v4.add("10.0.0.64/26".parse().unwrap());
+
+        apply_fallback_prefixes(
+            &mut result_v4,
+            &mut IpRange::new(),
+            &announced_v4,
+            &IpRange::new(),
+            &["10.0.0.0/24".parse().unwrap()],
+        );
+        result_v4.simplify();
+
+        let mut actual = result_v4
+            .iter()
+            .map(|net| net.to_string())
+            .collect::<Vec<_>>();
+        actual.sort();
+        assert_eq!(actual, ["10.0.0.0/26", "10.0.0.128/25"]);
+    }
+
+    #[test]
+    fn fallback_adds_nothing_when_fully_announced() {
+        let mut result_v4 = IpRange::new();
+        let mut announced_v4 = IpRange::new();
+        announced_v4.add("10.0.0.0/24".parse().unwrap());
+
+        apply_fallback_prefixes(
+            &mut result_v4,
+            &mut IpRange::new(),
+            &announced_v4,
+            &IpRange::new(),
+            &["10.0.0.0/24".parse().unwrap()],
+        );
+
+        assert!(result_v4.is_empty());
+    }
+
+    #[test]
+    fn fallback_supports_ipv6() {
+        let mut result_v6 = IpRange::new();
+        result_v6.add("2001:db8::/33".parse().unwrap());
+        let mut announced_v6 = IpRange::new();
+        announced_v6.add("2001:db8::/33".parse().unwrap());
+
+        apply_fallback_prefixes(
+            &mut IpRange::new(),
+            &mut result_v6,
+            &IpRange::new(),
+            &announced_v6,
+            &["2001:db8::/32".parse().unwrap()],
+        );
+        result_v6.simplify();
+
+        assert_eq!(
+            result_v6
+                .iter()
+                .map(|net| net.to_string())
+                .collect::<Vec<_>>(),
+            ["2001:db8::/32"]
+        );
+    }
+
+    #[test]
+    fn accepts_fallback_prefix_file() {
+        let opts =
+            Opts::try_parse_from(["bgptools", "--fallback-prefix-file", "prefixes.txt", "4134"])
+                .unwrap();
+
+        assert_eq!(
+            opts.fallback_prefix_file,
+            Some(PathBuf::from("prefixes.txt"))
+        );
     }
 
     #[test]
